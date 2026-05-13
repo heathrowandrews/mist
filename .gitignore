@@ -1,0 +1,36 @@
+.DS_Store
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.env.local
+local/
+*.log
+*.jsonl
+*.m4a
+*.mp3
+*.wav
+*.aiff
+*.flac
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Build artifacts
+build/
+dist/
+.build/
+client-mac-app/.build/
+.swiftpm/
+*.dSYM/
+*.egg-info/
+
+# Local project/private context
+CLAUDE.md
+configs/*.yaml
+!configs/example.yaml

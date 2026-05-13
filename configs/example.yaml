@@ -1,0 +1,38 @@
+# Bloom Dictate tenant config example.
+#
+# Copy to ~/.bloom-dictate/config/default.yaml and edit terms/phrases for
+# your own names, products, clients, and workflow words.
+
+tenant_id: default
+display_name: Default
+language: en
+model: mlx-community/whisper-large-v3-turbo
+keep_audio: false
+
+terms:
+  - Bloom Dictate
+  - Hammerspoon
+  - Tailscale
+  - OpenClaw
+  - Codex
+
+phrases:
+  - MacBook
+  - Mac mini
+  - local dictation
+
+post_correction:
+  enabled: true
+  model: qwen2.5:14b
+  system_prompt: |
+    You are a transcription correction pass.
+    Fix homophones, proper-noun errors, and obvious mishearings using the glossary.
+    Do not paraphrase or restructure. Preserve the speaker's original intent.
+    Output only the corrected text.
+
+prompt_mode:
+  enabled: false
+  model: qwen2.5:14b
+  system_prompt: |
+    Convert the dictated text into a clear task.
+    Output only valid JSON.

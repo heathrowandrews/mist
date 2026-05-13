@@ -1,0 +1,313 @@
+#!/usr/bin/env -S /usr/bin/python3 -u
+"""bd-stream-worker — stable-prefix streaming for Bloom Dictate.
+
+While bd-managed ffmpeg writes 5-second WAV segments, this worker:
+
+  1. Watches the segments directory for newly closed segments.
+  2. Each cycle, concatenates all closed segments into a cumulative WAV.
+  3. POSTs the cumulative audio to the daemon (correct=false → fast, no Ollama).
+  4. Compares the new transcript to the previous transcript word-by-word and
+     keeps only the longest common prefix as the "stable" text.
+  5. Appends a JSON event with whatever's newly stable (since previously typed)
+     to ~/.bloom-dictate/stream-events.jsonl. Hammerspoon reads the file and
+     types each event via keyStrokes.
+  6. On finalize (when bd.pid disappears), does one last cumulative pass to
+     pick up any tail that hadn't yet stabilized.
+
+Exits when ~/.bloom-dictate/bd.pid is gone.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+# --- Config ----------------------------------------------------------------
+
+STATE_DIR = Path.home() / ".bloom-dictate"
+SEG_DIR = STATE_DIR / "segments"
+PIDFILE = STATE_DIR / "bd.pid"
+EVENTS_PATH = STATE_DIR / "stream-events.jsonl"
+CONCAT_LIST = STATE_DIR / "concat-list.txt"
+CUMULATIVE = STATE_DIR / "cumulative.wav"
+LOG_PATH = STATE_DIR / "stream-worker.log"
+
+POLL_INTERVAL_S = 0.4
+DAEMON_TIMEOUT_S = 90
+MIN_FIRST_WORDS = 6      # below this, hold off on emitting first commit
+FIRST_COMMIT_FRACTION = 0.5  # on first pass, commit first half of words
+REPETITION_RATIO = 0.25  # unique/total below this on >10 words = reject
+
+
+# --- Helpers ---------------------------------------------------------------
+
+def log(msg: str) -> None:
+    with LOG_PATH.open("a") as f:
+        f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+
+
+def parse_env(path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not path.exists():
+        return env
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        env[k.strip()] = v.strip().strip("'\"")
+    return env
+
+
+_PUNCT_LSTRIP = re.compile(r"^[\s.…!?,;:\-—]+")
+_ELLIPSES = re.compile(r"\s*(?:\.{2,}|…)\s*")
+_MULTI_SPACE = re.compile(r"\s+")
+
+
+def normalize(text: str) -> str:
+    """Strip Whisper's chunk-edge artifacts: leading punctuation/ellipses,
+    internal stutter ellipses, double spaces."""
+    if not text:
+        return ""
+    text = _PUNCT_LSTRIP.sub("", text)
+    text = _ELLIPSES.sub(" ", text)
+    text = _MULTI_SPACE.sub(" ", text)
+    return text.strip()
+
+
+def is_repetitive(text: str) -> bool:
+    """Catch Whisper's repeat-loop hallucination."""
+    words = text.lower().split()
+    if len(words) <= 10:
+        return False
+    return len(set(words)) / len(words) < REPETITION_RATIO
+
+
+def longest_common_word_prefix(a: str, b: str) -> str:
+    aw = a.split()
+    bw = b.split()
+    common: list[str] = []
+    for wa, wb in zip(aw, bw):
+        if wa == wb:
+            common.append(wa)
+        else:
+            break
+    return " ".join(common)
+
+
+_TRAILING_PUNCT = ".,!?;:"
+
+
+def trim_boundary_punct(commit_text: str, full_text: str) -> str:
+    """If commit_text is a strict prefix of full_text, more text follows
+    after the commit, and the commit ends with a sentence-terminator, strip
+    that terminator from the last word. Whisper tends to add a period at
+    chunk boundaries that get revised once the next chunk lands; without
+    this, the period gets typed and then never un-typed."""
+    if not commit_text or not full_text.startswith(commit_text):
+        return commit_text
+    tail = full_text[len(commit_text):].lstrip()
+    if not tail:
+        return commit_text
+    stripped = commit_text.rstrip()
+    if stripped and stripped[-1] in _TRAILING_PUNCT:
+        return stripped.rstrip(_TRAILING_PUNCT)
+    return commit_text
+
+
+def list_closed_segments() -> list[Path]:
+    """Return sorted WAV segments that are 'closed'. A segment is closed when
+    its successor exists; if ffmpeg has exited (no PIDFILE), all are closed."""
+    segs = sorted(SEG_DIR.glob("seg-*.wav"))
+    if not segs:
+        return []
+    if PIDFILE.exists():
+        return segs[:-1]   # last is still being written
+    return segs
+
+
+def concat_segments(segs: list[Path], out_path: Path) -> bool:
+    """ffmpeg concat demuxer. Returns True on success."""
+    with CONCAT_LIST.open("w") as f:
+        for s in segs:
+            f.write(f"file '{s.absolute()}'\n")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "concat", "-safe", "0", "-i", str(CONCAT_LIST),
+                "-c", "copy", str(out_path),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        log(f"concat fail: {e.stderr.decode(errors='replace')[:200]}")
+        return False
+    except subprocess.TimeoutExpired:
+        log("concat timeout")
+        return False
+
+
+def transcribe(audio_path: Path, daemon_url: str, token: str, tenant: str) -> str:
+    """POST cumulative audio to daemon, return raw transcript or empty string."""
+    cmd = [
+        "curl", "-sS", "--max-time", str(DAEMON_TIMEOUT_S),
+        "-X", "POST", f"{daemon_url}/transcribe",
+        "-H", f"Authorization: Bearer {token}",
+        "-F", f"audio=@{audio_path}",
+        "-F", f"tenant_id={tenant}",
+        "-F", "mode=raw",
+        "-F", "correct=false",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=DAEMON_TIMEOUT_S + 5)
+    except subprocess.TimeoutExpired:
+        log("curl timeout")
+        return ""
+    if result.returncode != 0:
+        log(f"curl rc={result.returncode}: {result.stderr[:200]}")
+        return ""
+    try:
+        body = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        log(f"json decode fail: {result.stdout[:200]}")
+        return ""
+    if isinstance(body, dict) and body.get("detail"):
+        log(f"daemon error: {body['detail'][:200]}")
+        return ""
+    return body.get("raw", "") if isinstance(body, dict) else ""
+
+
+def emit_event(event_idx: int, text: str) -> None:
+    """Append a JSON event line for Hammerspoon to consume."""
+    with EVENTS_PATH.open("a") as f:
+        f.write(json.dumps({"idx": event_idx, "text": text}) + "\n")
+
+
+# --- Main loop -------------------------------------------------------------
+
+def main() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SEG_DIR.mkdir(parents=True, exist_ok=True)
+
+    env = parse_env(Path.home() / ".bloom-env")
+    daemon_url = env.get(
+        "BLOOM_DICTATE_URL",
+        "http://127.0.0.1:8788",
+    )
+    token = env.get("BLOOM_DICTATE_TOKEN", "")
+    tenant = env.get("BLOOM_DICTATE_TENANT", "default")
+
+    if not token:
+        log("FATAL: no BLOOM_DICTATE_TOKEN")
+        sys.exit(1)
+
+    previous_transcript = ""
+    typed_text = ""           # what Hammerspoon has typed so far (we tell it what)
+    event_idx = 0
+    last_seg_count = 0
+    has_committed_first = False
+
+    log(f"worker started · daemon={daemon_url}")
+
+    def do_pass(finalizing: bool) -> None:
+        nonlocal previous_transcript, typed_text, event_idx, has_committed_first
+
+        segs = (sorted(SEG_DIR.glob("seg-*.wav")) if finalizing
+                else list_closed_segments())
+        if not segs:
+            return
+
+        if not concat_segments(segs, CUMULATIVE):
+            return
+
+        raw = transcribe(CUMULATIVE, daemon_url, token, tenant)
+        new_transcript = normalize(raw)
+        if not new_transcript:
+            return
+        if is_repetitive(new_transcript):
+            log(f"repetition rejected (len={len(new_transcript)})")
+            return
+
+        # Stable text = longest common word-prefix between previous and new
+        # transcripts. On finalize, commit the entire new_transcript (last
+        # pass; no second chance for stability).
+        if finalizing:
+            stable = new_transcript
+        elif not has_committed_first and not previous_transcript:
+            # First pass with no previous to diff against. Commit a safe
+            # fraction so user sees text without waiting for a second pass.
+            words = new_transcript.split()
+            if len(words) >= MIN_FIRST_WORDS:
+                cut = max(1, int(len(words) * FIRST_COMMIT_FRACTION))
+                stable = " ".join(words[:cut])
+                has_committed_first = True
+            else:
+                stable = ""
+        else:
+            stable = longest_common_word_prefix(previous_transcript, new_transcript)
+            if stable and not has_committed_first:
+                has_committed_first = True
+
+        # Strip chunk-boundary punctuation: if Whisper ended the stable
+        # prefix with "." but more transcript follows, drop the punctuation
+        # (next pass will re-add it if it's truly there).
+        if not finalizing and stable:
+            stable = trim_boundary_punct(stable, new_transcript)
+
+        # What's newly stable vs already typed?
+        if stable and stable.startswith(typed_text):
+            new_part = stable[len(typed_text):]
+            # Ensure a leading space if we're appending to existing text.
+            if typed_text and new_part and not new_part.startswith(" ") \
+                    and not typed_text.endswith(" "):
+                new_part = " " + new_part
+            new_part = new_part.strip(" ")
+            if new_part:
+                # Emit the chars to type. Preserve internal spacing by checking
+                # whether previous typed_text ended with a space.
+                emit_text = new_part
+                if typed_text and not typed_text.endswith(" "):
+                    emit_text = " " + emit_text
+                event_idx += 1
+                emit_event(event_idx, emit_text)
+                typed_text = (typed_text + emit_text)
+                log(f"event {event_idx} stable_words={len(stable.split())} "
+                    f"new='{emit_text[:80]}'")
+        elif stable and not stable.startswith(typed_text):
+            # Whisper revised our committed text — log and wait. Don't backspace.
+            log(f"revision detected: typed='{typed_text[-60:]}' stable_tail="
+                f"'{stable[-60:]}' — skipping pass")
+
+        previous_transcript = new_transcript
+
+    # Streaming loop
+    while PIDFILE.exists():
+        segs = list_closed_segments()
+        if len(segs) > last_seg_count:
+            last_seg_count = len(segs)
+            do_pass(finalizing=False)
+        time.sleep(POLL_INTERVAL_S)
+
+    # Finalize
+    log("finalizing")
+    do_pass(finalizing=True)
+    log(f"worker exit · typed={len(typed_text)} chars · {event_idx} events")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log(f"FATAL {type(e).__name__}: {e}")
+        raise

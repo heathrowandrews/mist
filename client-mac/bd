@@ -1,0 +1,244 @@
+#!/bin/bash
+# bd — Bloom Dictate CLI. STREAMING client.
+#
+# bd start: starts ffmpeg segment muxer (5s WAV chunks) AND a stream worker
+#           that POSTs each closed chunk to the daemon and appends a JSON
+#           event line to ~/.bloom-dictate/stream-events.jsonl. Hammerspoon
+#           polls the events file and types each chunk via keyStrokes as it
+#           lands → text appears progressively while you speak.
+#
+# bd stop:  stops ffmpeg, the worker finalizes any unprocessed segments,
+#           accumulated transcript ends up on the clipboard for re-use.
+#
+# Subcommands:
+#   bd            # toggle: start if idle, stop if recording
+#   bd start
+#   bd stop
+#   bd cancel     # stop without finalizing/accumulating
+#   bd status     # state + elapsed
+#   bd devices    # list AVFoundation audio devices
+#   bd test FILE  # non-streaming single-file transcribe (smoke test)
+#
+# Env (sourced from ~/.bloom-env):
+#   BLOOM_DICTATE_URL    — daemon URL
+#   BLOOM_DICTATE_TOKEN  — bearer token
+#   BLOOM_DICTATE_DEVICE — ffmpeg avfoundation audio device (default ":default")
+#   BLOOM_DICTATE_TENANT — tenant id (default default)
+#   BD_MAX_SECONDS       — recording safety cap (default 600 = 10 min)
+#   BD_SEGMENT_SECONDS   — chunk size for streaming (default 5)
+set -euo pipefail
+
+BD_STATE_DIR="$HOME/.bloom-dictate"
+SEG_DIR="$BD_STATE_DIR/segments"
+PIDFILE="$BD_STATE_DIR/bd.pid"
+WORKER_PIDFILE="$BD_STATE_DIR/bd-worker.pid"
+STARTFILE="$BD_STATE_DIR/bd.start"
+EVENTS="$BD_STATE_DIR/stream-events.jsonl"
+LOGFILE="$BD_STATE_DIR/bd.log"
+WORKER_LOG="$BD_STATE_DIR/stream-worker.log"
+WORKER_SCRIPT="$HOME/bin/bd-stream-worker"
+
+mkdir -p "$BD_STATE_DIR" "$SEG_DIR"
+
+if [ -f "$HOME/.bloom-env" ]; then
+    set -a
+    # shellcheck disable=SC1090,SC1091
+    . "$HOME/.bloom-env"
+    set +a
+fi
+
+: "${BLOOM_DICTATE_URL:=http://127.0.0.1:8788}"
+: "${BLOOM_DICTATE_TOKEN:=}"
+: "${BLOOM_DICTATE_TENANT:=default}"
+: "${BLOOM_DICTATE_DEVICE:=:default}"
+: "${BD_MAX_SECONDS:=600}"
+: "${BD_SEGMENT_SECONDS:=3}"
+
+notify() {
+    local title="$1"
+    local msg="$2"
+    msg=$(printf '%s' "$msg" | sed 's/"/\\"/g')
+    title=$(printf '%s' "$title" | sed 's/"/\\"/g')
+    osascript -e "display notification \"$msg\" with title \"$title\"" >/dev/null 2>&1 || true
+}
+
+is_recording() {
+    [ -f "$PIDFILE" ] || return 1
+    local pid
+    pid=$(cat "$PIDFILE" 2>/dev/null || true)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+require_token() {
+    if [ -z "$BLOOM_DICTATE_TOKEN" ]; then
+        echo "bd: BLOOM_DICTATE_TOKEN not set" >&2
+        exit 2
+    fi
+}
+
+cmd_devices() {
+    ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 \
+        | grep -E "AVFoundation|\[[0-9]+\]" || true
+}
+
+cmd_start() {
+    if is_recording; then
+        echo "bd: already recording"
+        notify "Bloom Dictate" "Already recording"
+        return 0
+    fi
+    require_token
+
+    # Clean state for new session
+    rm -f "$SEG_DIR"/seg-*.wav
+    : > "$EVENTS"
+    : > "$WORKER_LOG"
+    : > "$LOGFILE"
+
+    # ffmpeg segment muxer — closes seg-N when seg-N+1 starts, so the worker
+    # has a clear "this chunk is done" signal.
+    nohup ffmpeg -hide_banner -loglevel warning \
+        -f avfoundation -i "$BLOOM_DICTATE_DEVICE" \
+        -t "$BD_MAX_SECONDS" \
+        -ac 1 -ar 16000 \
+        -f segment -segment_time "$BD_SEGMENT_SECONDS" -reset_timestamps 1 \
+        -y "$SEG_DIR/seg-%03d.wav" \
+        >>"$LOGFILE" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$PIDFILE"
+    date +%s > "$STARTFILE"
+
+    # Stream worker — polls SEG_DIR, posts cumulative audio each pass,
+    # uses longest-common-prefix to commit only stable words.
+    nohup "$WORKER_SCRIPT" >>"$WORKER_LOG" 2>&1 &
+    local wpid=$!
+    echo "$wpid" > "$WORKER_PIDFILE"
+
+    echo "bd: recording (ffmpeg=$pid worker=$wpid) chunks=${BD_SEGMENT_SECONDS}s"
+    notify "Bloom Dictate" "Streaming…"
+}
+
+cmd_stop() {
+    if ! is_recording; then
+        echo "bd: not recording" >&2
+        return 1
+    fi
+
+    local pid wpid elapsed
+    pid=$(cat "$PIDFILE")
+    wpid=$(cat "$WORKER_PIDFILE" 2>/dev/null || true)
+    elapsed=$(( $(date +%s) - $(cat "$STARTFILE" 2>/dev/null || echo 0) ))
+
+    # Stop ffmpeg gracefully (SIGINT lets it flush the in-flight segment).
+    kill -INT "$pid" 2>/dev/null || true
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && [ $i -lt 50 ]; do
+        sleep 0.1; i=$((i+1))
+    done
+    kill -TERM "$pid" 2>/dev/null || true
+
+    rm -f "$PIDFILE" "$STARTFILE"
+
+    # Worker exits once $PIDFILE is gone and it finalizes remaining segments.
+    # Wait up to 30s for it to drain (5s chunks + Whisper latency).
+    if [ -n "$wpid" ]; then
+        i=0
+        while kill -0 "$wpid" 2>/dev/null && [ $i -lt 300 ]; do
+            sleep 0.1; i=$((i+1))
+        done
+        rm -f "$WORKER_PIDFILE"
+    fi
+
+    # Assemble full transcript from events for clipboard re-use.
+    if [ -s "$EVENTS" ]; then
+        local full
+        full=$(jq -r '.text' "$EVENTS" | awk 'BEGIN{ORS=" "} {print}' | sed -E 's/[[:space:]]+$//')
+        printf '%s' "$full" | pbcopy
+        notify "Bloom Dictate" "Done · ${elapsed}s"
+        echo "bd: done. ${#full} chars on clipboard."
+    else
+        notify "Bloom Dictate" "No speech detected"
+        echo "bd: no events" >&2
+    fi
+}
+
+cmd_cancel() {
+    if ! is_recording; then
+        echo "bd: not recording" >&2
+        return 1
+    fi
+    local pid wpid
+    pid=$(cat "$PIDFILE")
+    wpid=$(cat "$WORKER_PIDFILE" 2>/dev/null || true)
+
+    kill -INT "$pid" 2>/dev/null || true
+    sleep 0.2
+    kill -9 "$pid" 2>/dev/null || true
+
+    if [ -n "$wpid" ]; then kill -9 "$wpid" 2>/dev/null || true; fi
+
+    rm -f "$PIDFILE" "$WORKER_PIDFILE" "$STARTFILE"
+    rm -f "$SEG_DIR"/seg-*.wav
+    : > "$EVENTS"
+
+    notify "Bloom Dictate" "Cancelled"
+    echo "bd: cancelled"
+}
+
+cmd_status() {
+    if is_recording; then
+        local pid started elapsed nseg nevt
+        pid=$(cat "$PIDFILE")
+        started=$(cat "$STARTFILE" 2>/dev/null || echo 0)
+        elapsed=$(( $(date +%s) - started ))
+        nseg=$(ls "$SEG_DIR"/seg-*.wav 2>/dev/null | wc -l | tr -d ' ')
+        nevt=$(wc -l < "$EVENTS" 2>/dev/null | tr -d ' ' || echo 0)
+        echo "recording  pid=$pid  elapsed=${elapsed}s  segments=$nseg  events=$nevt"
+    else
+        echo "idle"
+    fi
+}
+
+# Legacy single-file transcribe path — used by `bd test FILE` for smoke
+# testing. NOT used by the streaming hotkey path.
+cmd_test() {
+    local file="${1:-}"
+    if [ -z "$file" ] || [ ! -f "$file" ]; then
+        echo "bd test FILE — file required" >&2
+        return 2
+    fi
+    require_token
+    local resp
+    resp=$(curl -sS --max-time 60 \
+        -X POST "$BLOOM_DICTATE_URL/transcribe" \
+        -H "Authorization: Bearer $BLOOM_DICTATE_TOKEN" \
+        -F "audio=@$file" \
+        -F "tenant_id=$BLOOM_DICTATE_TENANT" \
+        -F "mode=raw")
+    local text
+    text=$(printf '%s' "$resp" | jq -r '.corrected // .raw // ""')
+    printf '%s' "$text" | sed -E 's/^[[:space:]]+//' | pbcopy
+    printf '%s\n' "$text"
+}
+
+main() {
+    local sub="${1:-toggle}"
+    case "$sub" in
+        toggle|"")
+            if is_recording; then cmd_stop; else cmd_start; fi
+            ;;
+        start)   cmd_start ;;
+        stop)    cmd_stop ;;
+        cancel)  cmd_cancel ;;
+        status)  cmd_status ;;
+        devices) cmd_devices ;;
+        test)    shift; cmd_test "${1:-}" ;;
+        -h|--help|help) sed -n '2,30p' "$0" ;;
+        *)
+            echo "bd: unknown subcommand '$sub'" >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
