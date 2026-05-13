@@ -20,6 +20,7 @@ local DOUBLE_TAP_WINDOW  = 0.35
 local REVISION_DEBOUNCE_SEC = 0.20
 local END_GRACE_SEC      = 2.25
 local CHIMES_ENABLED     = true
+local CMD_HOTKEY_CODES   = { [54] = true, [55] = true }
 
 local state             = "idle"
 local rcmdDown          = false
@@ -528,6 +529,14 @@ local function ensurePolling(resetToEnd)
 end
 
 local function beginTyping()
+    if pendingEndTimer and isTyping then
+        pendingEndTimer:stop()
+        pendingEndTimer = nil
+        bdHandleLog("end grace canceled reason=resume typing")
+        pressedAt = hs.timer.secondsSinceEpoch() - HOLD_THRESHOLD - 0.01
+        state = "rec_hold"
+        return
+    end
     if finishPendingEnd then finishPendingEnd("begin typing") end
     ensurePolling(true)
     cancelPendingRevision("begin typing")
@@ -599,9 +608,10 @@ local function bdLog(msg)
     end
 end
 
--- Only Right-⌘ owns dictation. Letting Left-⌘ in here makes normal app
--- shortcuts look like dictation attempts.
-local function isCmdHotkey(kc) return kc == KEY_RIGHT_CMD end
+-- Most keyboards report physical Right-⌘ as kc=54, but some Karabiner /
+-- external-keyboard paths report kc=55. Treat both as the dictation key so
+-- the bridge does not go dead when macOS changes the modifier source.
+local function isCmdHotkey(kc) return CMD_HOTKEY_CODES[kc] == true end
 
 bdTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
     local kc = event:getKeyCode()
