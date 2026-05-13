@@ -42,24 +42,13 @@ final class AudioCapture: NSObject, @unchecked Sendable {
             position: .unspecified
         ).devices
 
-        // Follow the system default input device (set in System Settings →
-        // Sound → Input). This lets you switch microphones without rebuilding
-        // the app.
-        //
-        // Known macOS limitation: AirPods Max (H1 chip) delivers silent
-        // audio when macOS routes them via A2DP (high-quality stereo). They
-        // only enable the mic in HFP (Hands-Free Profile), which macOS
-        // typically switches into for FaceTime / Voice Memos. AVCaptureSession
-        // does not always trigger that switch. If peak amplitude stays
-        // ~0.000 with AirPods selected, switch input to MacBook Pro
-        // Microphone in System Settings.
-        guard let device = AVCaptureDevice.default(for: .audio) else {
+        guard let device = selectDevice(from: allDevices) else {
             throw NSError(domain: "AudioCapture", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "no audio input device (set one in System Settings → Sound → Input)"
             ])
         }
 
-        onDiagnostic?("using system-default audio device: \(device.localizedName) [\(device.uniqueID)]")
+        onDiagnostic?("using audio device: \(device.localizedName) [\(device.uniqueID)]")
         for d in allDevices {
             let marker = (d.uniqueID == device.uniqueID) ? " ← selected" : ""
             onDiagnostic?("  available: \(d.localizedName) [\(d.uniqueID)]\(marker)")
@@ -85,6 +74,50 @@ final class AudioCapture: NSObject, @unchecked Sendable {
 
         session.startRunning()
         isRunning = true
+    }
+
+    private func selectDevice(from allDevices: [AVCaptureDevice]) -> AVCaptureDevice? {
+        let env = ProcessInfo.processInfo.environment
+        if let requested = env["BLOOM_DICTATE_AUDIO_DEVICE"], !requested.isEmpty {
+            if let match = allDevices.first(where: { device in
+                device.uniqueID == requested ||
+                    device.localizedName.localizedCaseInsensitiveContains(requested)
+            }) {
+                onDiagnostic?("audio override matched BLOOM_DICTATE_AUDIO_DEVICE=\(requested)")
+                return match
+            }
+            onDiagnostic?("audio override did not match any device: \(requested)")
+        }
+
+        guard let systemDefault = AVCaptureDevice.default(for: .audio) else {
+            return allDevices.first
+        }
+
+        if env["BLOOM_DICTATE_PREFER_SYSTEM_INPUT"] == "1" {
+            onDiagnostic?("using system-default input because BLOOM_DICTATE_PREFER_SYSTEM_INPUT=1")
+            return systemDefault
+        }
+
+        if isLikelySilentBluetoothInput(systemDefault),
+           let builtIn = allDevices.first(where: isBuiltInMacMicrophone) {
+            onDiagnostic?("avoiding likely silent Bluetooth input \(systemDefault.localizedName); using built-in microphone")
+            return builtIn
+        }
+
+        return systemDefault
+    }
+
+    private func isLikelySilentBluetoothInput(_ device: AVCaptureDevice) -> Bool {
+        let name = device.localizedName.lowercased()
+        return name.contains("airpods") || name.contains("beats")
+    }
+
+    private func isBuiltInMacMicrophone(_ device: AVCaptureDevice) -> Bool {
+        let name = device.localizedName.lowercased()
+        return device.uniqueID == "BuiltInMicrophoneDevice" ||
+            name.contains("macbook") ||
+            name.contains("built-in") ||
+            name.contains("built in")
     }
 
     func stop() {

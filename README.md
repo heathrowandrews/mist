@@ -82,7 +82,7 @@ export BLOOM_DICTATE_TENANT=default
 
 - This is not notarized or packaged for general users yet.
 - The hotkey bridge currently depends on Hammerspoon because native Swift event-tap delivery was unreliable during development.
-- If Bluetooth headphones produce silent audio, switch macOS Sound Input to the built-in microphone. Some headsets stay in high-quality output mode and do not expose usable microphone samples to `AVCaptureSession`.
+- Bluetooth headset inputs can be unreliable on macOS when the device stays in high-quality stereo mode. Bloom Dictate avoids known-problem AirPods/Beats capture inputs and falls back to the built-in mic when available. Set `BLOOM_DICTATE_PREFER_SYSTEM_INPUT=1` to force the macOS default input, or `BLOOM_DICTATE_AUDIO_DEVICE=<name-or-id>` to pick a specific device.
 
 ## License
 

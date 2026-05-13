@@ -18,6 +18,7 @@ local KEY_RIGHT_CMD = 54
 local HOLD_THRESHOLD     = 0.25
 local DOUBLE_TAP_WINDOW  = 0.35
 local REVISION_DEBOUNCE_SEC = 0.20
+local END_GRACE_SEC      = 2.25
 local CHIMES_ENABLED     = true
 
 local state             = "idle"
@@ -26,6 +27,8 @@ local pressedAt         = 0
 local pendingStopTimer  = nil
 local pendingRevisionTimer = nil
 local pendingRevision   = nil
+local pendingEndTimer    = nil
+local finishPendingEnd   = nil
 
 -- SFSpeech streamer state
 local STREAM_PATH       = os.getenv("HOME") .. "/.bloom-dictate/dictate-stream.jsonl"
@@ -525,6 +528,7 @@ local function ensurePolling(resetToEnd)
 end
 
 local function beginTyping()
+    if finishPendingEnd then finishPendingEnd("begin typing") end
     ensurePolling(true)
     cancelPendingRevision("begin typing")
     bridgeSpaceAtSessionStart = focusedTextNeedsBridgeSpace()
@@ -566,6 +570,25 @@ local function endTyping()
             targetApp = nil
         end
     end
+end
+
+finishPendingEnd = function(reason)
+    if pendingEndTimer then
+        pendingEndTimer:stop()
+        pendingEndTimer = nil
+        bdHandleLog("end grace flushed reason=" .. tostring(reason))
+    end
+    if isTyping then endTyping() end
+end
+
+local function scheduleEndTyping(reason)
+    if pendingEndTimer then pendingEndTimer:stop() end
+    bdHandleLog("end grace scheduled reason=" .. tostring(reason) .. " sec=" .. tostring(END_GRACE_SEC))
+    pendingEndTimer = hs.timer.doAfter(END_GRACE_SEC, function()
+        pendingEndTimer = nil
+        bdHandleLog("end grace fired")
+        if isTyping then endTyping() end
+    end)
 end
 
 local function bdLog(msg)
@@ -613,7 +636,7 @@ bdTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
             hs.alert.show("🎙 locked · tap Right-⌘ to stop", 1.5)
         elseif state == "rec_locked" then
             state = "idle"
-            endTyping()
+            scheduleEndTyping("locked stop")
             playChime("stop")
             bdSetMenubar(false)
         end
@@ -634,7 +657,7 @@ bdTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
                 end)
             else
                 state = "idle"
-                endTyping()
+                scheduleEndTyping("hold release")
                 playChime("stop")
                 bdSetMenubar(false)
             end
@@ -648,7 +671,7 @@ bdTap:start()
 hs.hotkey.bind({"ctrl", "alt", "cmd"}, "escape", function()
     cancelPending()
     state = "idle"
-    endTyping()
+    finishPendingEnd("cancel")
     playChime("cancel")
     bdSetMenubar(false)
 end)
