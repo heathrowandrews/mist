@@ -16,7 +16,7 @@
 local KEY_RIGHT_CMD = 54
 
 local HOLD_THRESHOLD     = 0.25
-local DOUBLE_TAP_WINDOW  = 0.35
+local DOUBLE_TAP_WINDOW  = 0.55
 local REVISION_DEBOUNCE_SEC = 0.20
 local END_GRACE_SEC      = 2.25
 local CHIMES_ENABLED     = true
@@ -282,6 +282,10 @@ local function bdSetMenubar(recording)
 end
 bdSetMenubar(false)
 
+local function syncMenubar()
+    bdSetMenubar(isTyping == true)
+end
+
 local function playChime(kind)
     if not CHIMES_ENABLED then return end
     local names = {
@@ -534,9 +538,11 @@ local function beginTyping()
         bdHandleLog("end grace canceled reason=resume typing")
         pressedAt = hs.timer.secondsSinceEpoch() - HOLD_THRESHOLD - 0.01
         state = "rec_hold"
+        syncMenubar()
         return
     end
     if finishPendingEnd then finishPendingEnd("begin typing") end
+    ensureStreamerRunning()
     ensurePolling(true)
     cancelPendingRevision("begin typing")
     bridgeSpaceAtSessionStart = focusedTextNeedsBridgeSpace()
@@ -547,6 +553,7 @@ local function beginTyping()
     segmentClosed = false
     targetApp = hs.application.frontmostApplication()
     isTyping = true
+    syncMenubar()
     hs.timer.doAfter(0.02, pollStreamEvents)
 end
 
@@ -578,6 +585,7 @@ local function endTyping()
             targetApp = nil
         end
     end
+    syncMenubar()
 end
 
 finishPendingEnd = function(reason)
@@ -633,17 +641,18 @@ bdTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
             state = "rec_hold"
             beginTyping()
             playChime("start")
-            bdSetMenubar(true)
+            syncMenubar()
         elseif state == "tap_pending" then
             cancelPending()
             state = "rec_locked"
             playChime("lock")
             hs.alert.show("🎙 locked · tap Right-⌘ to stop", 1.5)
+            syncMenubar()
         elseif state == "rec_locked" then
             state = "idle"
             scheduleEndTyping("locked stop")
             playChime("stop")
-            bdSetMenubar(false)
+            syncMenubar()
         end
     else
         -- RELEASE
@@ -656,7 +665,7 @@ bdTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
                         state = "idle"
                         endTyping()
                         playChime("stop")
-                        bdSetMenubar(false)
+                        syncMenubar()
                     end
                     pendingStopTimer = nil
                 end)
@@ -664,7 +673,7 @@ bdTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
                 state = "idle"
                 scheduleEndTyping("hold release")
                 playChime("stop")
-                bdSetMenubar(false)
+                syncMenubar()
             end
         end
     end
@@ -678,7 +687,7 @@ hs.hotkey.bind({"ctrl", "alt", "cmd"}, "escape", function()
     state = "idle"
     finishPendingEnd("cancel")
     playChime("cancel")
-    bdSetMenubar(false)
+    syncMenubar()
 end)
 
 -- Kick off the BloomDictate.app streamer + the polling loop on Hammerspoon load.
@@ -691,6 +700,7 @@ hs.timer.doAfter(1.0, ensurePolling)
 bdHealthTimer = hs.timer.doEvery(5.0, function()
     ensureStreamerRunning()
     ensurePolling(false)
+    syncMenubar()
 end)
 
 -- Quiet load — no startup alert. Menubar 🌱 / 🎙 is the visible state.
