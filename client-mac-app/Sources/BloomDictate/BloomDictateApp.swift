@@ -113,6 +113,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastPartial: String = ""
     private var lastRecognitionEventAt: Date = Date()
     private var lastWatchdogRestartAt: Date = .distantPast
+    private var watchdogActiveAudioWindows: Int = 0
+    private let watchdogPeakThreshold: Float = 0.08
+    private let watchdogRequiredActiveWindows: Int = 2
+    private let watchdogMinRecognitionQuietSec: TimeInterval = 10
+    private let watchdogRestartCooldownSec: TimeInterval = 30
 
     // --streamer mode: just emit SFSpeech partials as JSON on stdout. No
     // hotkey, no keystroke, no menubar — Hammerspoon (or another wrapper)
@@ -126,11 +131,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         recognizer.onPartial = { [weak self] text in
             self?.lastRecognitionEventAt = Date()
+            self?.watchdogActiveAudioWindows = 0
             emit(type: "partial", text: text)
             self?.handlePartial(text)
         }
         recognizer.onFinal = { [weak self] text in
             self?.lastRecognitionEventAt = Date()
+            self?.watchdogActiveAudioWindows = 0
             emit(type: "final", text: text)
             self?.handlePartial(text)
         }
@@ -238,12 +245,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleAudioLevel(_ peak: Float) {
-        guard peak >= 0.08 else { return }
+        guard peak >= watchdogPeakThreshold else {
+            watchdogActiveAudioWindows = 0
+            return
+        }
+
+        watchdogActiveAudioWindows += 1
+        guard watchdogActiveAudioWindows >= watchdogRequiredActiveWindows else { return }
+
         let now = Date()
         let recognitionQuietFor = now.timeIntervalSince(lastRecognitionEventAt)
         let restartQuietFor = now.timeIntervalSince(lastWatchdogRestartAt)
-        guard recognitionQuietFor > 10, restartQuietFor > 15 else { return }
+        guard recognitionQuietFor > watchdogMinRecognitionQuietSec,
+              restartQuietFor > watchdogRestartCooldownSec
+        else { return }
 
+        watchdogActiveAudioWindows = 0
         lastWatchdogRestartAt = now
         log("watchdog: audio peak \(String(format: "%.4f", peak)) but no recognition for \(String(format: "%.1f", recognitionQuietFor))s; restarting recognizer")
         recognizer.restartAfterStall(reason: "audio without recognition")
