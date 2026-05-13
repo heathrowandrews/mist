@@ -24,6 +24,13 @@ local ACTIVE_POLL_INTERVAL = 0.02
 local AUTO_PERIOD_ENABLED = true
 local AUTO_PERIOD_MIN_WORDS = 7
 local CHIMES_ENABLED     = true
+local CHIME_VOLUME       = 0.32
+local CHIME_SOUNDS       = {
+    start = "Pop",
+    stop = "Bottle",
+    lock = "Purr",
+    cancel = "Submarine",
+}
 
 local state             = "idle"
 local rcmdDown          = false
@@ -336,16 +343,13 @@ end
 
 local function playChime(kind)
     if not CHIMES_ENABLED then return end
-    local names = {
-        start = "Tink",
-        stop = "Pop",
-        lock = "Glass",
-        cancel = "Basso",
-    }
-    local soundName = names[kind]
+    local soundName = CHIME_SOUNDS[kind]
     if not soundName then return end
     local sound = hs.sound.getByName(soundName)
-    if sound then sound:play() end
+    if sound then
+        pcall(function() sound:volume(CHIME_VOLUME) end)
+        sound:play()
+    end
 end
 
 local function cancelPending()
