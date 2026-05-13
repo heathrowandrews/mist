@@ -21,6 +21,8 @@ local REVISION_DEBOUNCE_SEC = 0.20
 local END_GRACE_SEC      = 3.50
 local IDLE_POLL_INTERVAL = 0.05
 local ACTIVE_POLL_INTERVAL = 0.02
+local AUTO_PERIOD_ENABLED = true
+local AUTO_PERIOD_MIN_WORDS = 7
 local CHIMES_ENABLED     = true
 
 local state             = "idle"
@@ -201,6 +203,9 @@ local GLOSSARY_REPLACEMENTS = {
     { "voice box",  "VoiceBox" },
     { "answer host","AnswerHost" },
     { "bloom dictate", "Bloom Dictate" },
+    { "hot key",    "hotkey" },
+    { "hockey key", "hotkey" },
+    { "right command", "Right Command" },
     -- Tech
     { "tail scale", "Tailscale" },
     { "tail wind",  "Tailwind" },
@@ -259,9 +264,38 @@ local function applyCorrection(original, corrected)
     if #toType > 0 then postUnicode(toType) end
 end
 
+local function capitalizeLeadingLetter(text)
+    local prefix, letter, rest = (text or ""):match("^(%s*)(%a)(.*)$")
+    if letter then
+        return prefix .. letter:upper() .. rest
+    end
+    return text
+end
+
 local function typeFreshPartial(partial)
-    if sessionTypedAny and not typedText:match("%s$") and partial:match("^%w") then
+    local currentSegment = (baselinePartial or "") .. (typedText or "")
+    local lastWord = currentSegment:match("([%a']+)%s*$")
+    local endsIncomplete = lastWord and ({
+        ["and"] = true, ["or"] = true, ["but"] = true, ["the"] = true,
+        ["to"] = true, ["of"] = true, ["in"] = true, ["with"] = true,
+    })[lastWord:lower()]
+    if AUTO_PERIOD_ENABLED
+       and #currentSegment >= 24
+       and not currentSegment:gsub("%s+$", ""):match("[%.%!%?][\"'%)%]]*$")
+       and not endsIncomplete then
+        local _, words = currentSegment:gsub("%S+", "")
+        if words >= AUTO_PERIOD_MIN_WORDS then
+            postUnicode(".")
+            typedText = typedText .. "."
+            currentSegment = currentSegment .. "."
+        end
+    end
+
+    if sessionTypedAny and #currentSegment > 0 and not currentSegment:match("%s$") and partial:match("^%w") then
         smartType(" ")
+    end
+    if currentSegment:gsub("%s+$", ""):match("[%.%!%?][\"'%)%]]*$") then
+        partial = capitalizeLeadingLetter(partial)
     end
     smartType(partial)
     baselinePartial = partial
@@ -339,6 +373,68 @@ local function bdHandleLog(msg)
     end
 end
 
+local function currentSegmentText()
+    return (baselinePartial or "") .. (typedText or "")
+end
+
+local function countWords(text)
+    local _, count = (text or ""):gsub("%S+", "")
+    return count
+end
+
+local function endsWithTerminalPunctuation(text)
+    local trimmed = (text or ""):gsub("%s+$", "")
+    return trimmed:match("[%.%!%?][\"'%)%]]*$") ~= nil
+end
+
+local INCOMPLETE_FINAL_WORDS = {
+    ["a"] = true, ["an"] = true, ["and"] = true, ["as"] = true,
+    ["at"] = true, ["but"] = true, ["for"] = true, ["from"] = true,
+    ["if"] = true, ["in"] = true, ["into"] = true, ["of"] = true,
+    ["on"] = true, ["or"] = true, ["so"] = true, ["that"] = true,
+    ["the"] = true, ["then"] = true, ["to"] = true, ["with"] = true,
+}
+
+local function likelyIncompleteEnding(text)
+    local word = (text or ""):match("([%a']+)[%s%)]*$")
+    return word ~= nil and INCOMPLETE_FINAL_WORDS[word:lower()] == true
+end
+
+local function maybeAppendTerminalPeriod(reason)
+    if not AUTO_PERIOD_ENABLED then return false end
+    local text = currentSegmentText()
+    if #text < 24 or countWords(text) < AUTO_PERIOD_MIN_WORDS then return false end
+    if endsWithTerminalPunctuation(text) or likelyIncompleteEnding(text) then return false end
+
+    postUnicode(".")
+    typedText = typedText .. "."
+    bdHandleLog("auto period reason=" .. tostring(reason) .. " segment.len=" .. tostring(#text))
+    return true
+end
+
+local function markSegmentState(eventType, reason)
+    if eventType == "final" then
+        maybeAppendTerminalPeriod(reason)
+        segmentClosed = true
+    else
+        segmentClosed = false
+    end
+end
+
+local function restoreDroppedLeadWord(rendered, partial)
+    local lead, rest = (rendered or ""):match("^(%S+)%s+(.+)$")
+    if not lead or #lead > 3 or not partial or #partial < 8 then
+        return partial, false
+    end
+
+    local compareLen = math.min(#partial, #rest)
+    if compareLen >= 8 and rest:sub(1, compareLen):lower() == partial:sub(1, compareLen):lower() then
+        local restoredTail = rest:sub(1, 1) .. partial:sub(2)
+        return lead .. " " .. restoredTail, true
+    end
+    return partial, false
+end
+
 local function applyRevision(data, force)
     if not data then return false end
     if not force then
@@ -361,10 +457,19 @@ local function applyRevision(data, force)
     end
 
     if data.mode == "full" then
-        local renderedSegment = baselinePartial .. typedText
-        local keep = commonPrefixLen(renderedSegment, data.partial)
+        local renderedSegment = currentSegmentText()
+        local targetPartial = data.partial
+        if commonPrefixLen(renderedSegment, targetPartial) < 5 then
+            local restored, didRestore = restoreDroppedLeadWord(renderedSegment, targetPartial)
+            if didRestore then
+                targetPartial = restored
+                bdHandleLog("  -> path: full revision restored dropped lead word")
+            end
+        end
+
+        local keep = commonPrefixLen(renderedSegment, targetPartial)
         local deleteCount = #renderedSegment - keep
-        local toType = data.partial:sub(keep + 1)
+        local toType = targetPartial:sub(keep + 1)
         bdHandleLog("  -> path: full revision apply, keep=" .. keep .. " delete=" .. deleteCount .. " type.len=" .. #toType)
         if deleteCount > 0 then
             backspace(deleteCount)
@@ -372,9 +477,9 @@ local function applyRevision(data, force)
         if #toType > 0 then
             smartType(toType)
         end
-        baselinePartial = data.partial
+        baselinePartial = targetPartial
         typedText = ""
-        segmentClosed = (data.eventType == "final")
+        markSegmentState(data.eventType, "full revision")
         return true
     end
 
@@ -390,7 +495,7 @@ local function applyRevision(data, force)
         smartType(toType)
     end
     typedText = newPortion
-    segmentClosed = (data.eventType == "final")
+    markSegmentState(data.eventType, "tail revision")
     return true
 end
 
@@ -466,7 +571,7 @@ local function handlePartial(partial, eventType)
         if eventType == "final" then
             flushPendingRevision("empty final", true)
             bdHandleLog("  -> path: empty final, close segment")
-            segmentClosed = true
+            markSegmentState(eventType, "empty final")
         end
         return
     end
@@ -476,30 +581,31 @@ local function handlePartial(partial, eventType)
         bdHandleLog("  -> path: segmentClosed branch, typeFreshPartial")
         segmentClosed = false
         typeFreshPartial(partial)
-        segmentClosed = (eventType == "final")
+        markSegmentState(eventType, "fresh final")
         return
     end
 
     if partial:sub(1, #baselinePartial) ~= baselinePartial then
-        local renderedSegment = baselinePartial .. typedText
+        local renderedSegment = currentSegmentText()
         local keep = commonPrefixLen(renderedSegment, partial)
         local shortReset = (#renderedSegment > 10)
             and (keep < 5)
             and (#partial < math.max(20, #renderedSegment // 2))
 
-        if #renderedSegment > 0 and not shortReset then
+        local _, restoresLeadWord = restoreDroppedLeadWord(renderedSegment, partial)
+        if #renderedSegment > 0 and not shortReset and (keep >= 5 or restoresLeadWord) then
             bdHandleLog(string.format(
                 "  -> path: full revision candidate, keep=%d rendered.len=%d partial.len=%d",
                 keep, #renderedSegment, #partial))
             scheduleFullRevision(partial, eventType)
-            segmentClosed = (eventType == "final")
+            if eventType ~= "final" then segmentClosed = false end
             return
         end
 
         cancelPendingRevision("divergent partial")
         bdHandleLog("  -> path: divergent reset, typeFreshPartial")
         typeFreshPartial(partial)
-        segmentClosed = (eventType == "final")
+        markSegmentState(eventType, "divergent reset")
         return
     end
 
@@ -535,14 +641,14 @@ local function handlePartial(partial, eventType)
                 "  -> path: rotation detected (keep=%d delete=%d new.len=%d typed.len=%d), typeFreshPartial",
                 keep, deleteCount, #newPortion, #typedText))
             typeFreshPartial(partial)
-            segmentClosed = (eventType == "final")
+            markSegmentState(eventType, "rotation reset")
             return
         end
 
         bdHandleLog("  -> path: revision candidate, keep=" .. keep .. " delete=" .. deleteCount .. " type.len=" .. #toType)
         scheduleRevision(partial, eventType, newPortion)
     end
-    segmentClosed = (eventType == "final")
+    markSegmentState(eventType, "handle final")
 end
 
 local function pollStreamEvents()
@@ -678,11 +784,12 @@ end
 
 local function endTyping()
     flushPendingRevision("end typing", true)
+    maybeAppendTerminalPeriod("end typing")
     isTyping = false
     stopActivePoller("end typing")
     -- Capture what we typed so the glossary pass can compute a diff
     -- before we clear state.
-    local original = typedText
+    local original = currentSegmentText()
     local app = targetApp
     typedText = ""
     baselinePartial = ""
