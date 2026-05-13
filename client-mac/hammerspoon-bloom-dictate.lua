@@ -18,7 +18,9 @@ local KEY_RIGHT_CMD = 54
 local HOLD_THRESHOLD     = 0.25
 local DOUBLE_TAP_WINDOW  = 0.55
 local REVISION_DEBOUNCE_SEC = 0.20
-local END_GRACE_SEC      = 2.25
+local END_GRACE_SEC      = 3.50
+local IDLE_POLL_INTERVAL = 0.05
+local ACTIVE_POLL_INTERVAL = 0.02
 local CHIMES_ENABLED     = true
 
 local state             = "idle"
@@ -33,7 +35,9 @@ local finishPendingEnd   = nil
 -- SFSpeech streamer state
 local STREAM_PATH       = os.getenv("HOME") .. "/.bloom-dictate/dictate-stream.jsonl"
 local streamPoller      = nil
+local activePoller      = nil
 local streamFilePos     = 0
+local lastPollErrorAt   = 0
 local lastPartial       = ""       -- most recent partial we've SEEN from SFSpeech
 local isTyping          = false    -- true while hotkey is held / locked
 local baselinePartial   = ""       -- partial text at the moment recording started
@@ -123,10 +127,16 @@ local function focusedTextNeedsBridgeSpace()
     local ok, elem = pcall(hs.uielement.focusedElement)
     if not ok or not elem then return false end
 
-    local value = elem:attributeValue("AXValue")
+    local okValue, value = pcall(function()
+        return elem:attributeValue("AXValue")
+    end)
+    if not okValue then return false end
     if type(value) ~= "string" or #value == 0 then return false end
 
-    local range = elem:attributeValue("AXSelectedTextRange")
+    local okRange, range = pcall(function()
+        return elem:attributeValue("AXSelectedTextRange")
+    end)
+    if not okRange then range = nil end
     local location = nil
     if type(range) == "table" then
         location = range.location or range.loc
@@ -272,6 +282,10 @@ end
 local bdMenubar = hs.menubar.new()
 local function bdSetMenubar(recording)
     if not bdMenubar then return end
+    local ok, inMenu = pcall(function() return bdMenubar:isInMenuBar() end)
+    if ok and not inMenu then
+        pcall(function() bdMenubar:returnToMenuBar() end)
+    end
     if recording then
         bdMenubar:setTitle("🎙")
         bdMenubar:setTooltip("Bloom Dictate · recording")
@@ -340,6 +354,28 @@ local function applyRevision(data, force)
             bdHandleLog("  -> path: revision skipped; typed text changed")
             return false
         end
+        if data.mode == "full" and baselinePartial ~= data.baselineAtSchedule then
+            bdHandleLog("  -> path: full revision skipped; baseline changed")
+            return false
+        end
+    end
+
+    if data.mode == "full" then
+        local renderedSegment = baselinePartial .. typedText
+        local keep = commonPrefixLen(renderedSegment, data.partial)
+        local deleteCount = #renderedSegment - keep
+        local toType = data.partial:sub(keep + 1)
+        bdHandleLog("  -> path: full revision apply, keep=" .. keep .. " delete=" .. deleteCount .. " type.len=" .. #toType)
+        if deleteCount > 0 then
+            backspace(deleteCount)
+        end
+        if #toType > 0 then
+            smartType(toType)
+        end
+        baselinePartial = data.partial
+        typedText = ""
+        segmentClosed = (data.eventType == "final")
+        return true
     end
 
     local newPortion = data.newPortion
@@ -386,10 +422,12 @@ end
 local function scheduleRevision(partial, eventType, newPortion)
     cancelPendingRevision("superseded")
     pendingRevision = {
+        mode = "tail",
         partial = partial,
         eventType = eventType,
         newPortion = newPortion,
         typedAtSchedule = typedText,
+        baselineAtSchedule = baselinePartial,
     }
     pendingRevisionTimer = hs.timer.doAfter(REVISION_DEBOUNCE_SEC, function()
         pendingRevisionTimer = nil
@@ -398,6 +436,24 @@ local function scheduleRevision(partial, eventType, newPortion)
         applyRevision(data, false)
     end)
     bdHandleLog("  -> path: revision scheduled debounce=" .. tostring(REVISION_DEBOUNCE_SEC))
+end
+
+local function scheduleFullRevision(partial, eventType)
+    cancelPendingRevision("superseded")
+    pendingRevision = {
+        mode = "full",
+        partial = partial,
+        eventType = eventType,
+        typedAtSchedule = typedText,
+        baselineAtSchedule = baselinePartial,
+    }
+    pendingRevisionTimer = hs.timer.doAfter(REVISION_DEBOUNCE_SEC, function()
+        pendingRevisionTimer = nil
+        local data = pendingRevision
+        pendingRevision = nil
+        applyRevision(data, false)
+    end)
+    bdHandleLog("  -> path: full revision scheduled debounce=" .. tostring(REVISION_DEBOUNCE_SEC))
 end
 
 local function handlePartial(partial, eventType)
@@ -425,8 +481,23 @@ local function handlePartial(partial, eventType)
     end
 
     if partial:sub(1, #baselinePartial) ~= baselinePartial then
+        local renderedSegment = baselinePartial .. typedText
+        local keep = commonPrefixLen(renderedSegment, partial)
+        local shortReset = (#renderedSegment > 10)
+            and (keep < 5)
+            and (#partial < math.max(20, #renderedSegment // 2))
+
+        if #renderedSegment > 0 and not shortReset then
+            bdHandleLog(string.format(
+                "  -> path: full revision candidate, keep=%d rendered.len=%d partial.len=%d",
+                keep, #renderedSegment, #partial))
+            scheduleFullRevision(partial, eventType)
+            segmentClosed = (eventType == "final")
+            return
+        end
+
         cancelPendingRevision("divergent partial")
-        bdHandleLog("  -> path: divergent, typeFreshPartial")
+        bdHandleLog("  -> path: divergent reset, typeFreshPartial")
         typeFreshPartial(partial)
         segmentClosed = (eventType == "final")
         return
@@ -495,11 +566,13 @@ local function pollStreamEvents()
     -- half-written JSON object at EOF, fail to decode it, then move the cursor
     -- past it forever. That is deadly for live partials during a hotkey hold.
     local consumed = 0
+    local records = 0
     for line, nextIndex in chunk:gmatch("([^\n]*)\n()") do
         consumed = nextIndex - 1
         if line and #line > 0 then
             local ok, evt = pcall(hs.json.decode, line)
             if ok and evt and type(evt.type) == "string" then
+                records = records + 1
                 if evt.type == "partial" or evt.type == "final" then
                     handlePartial(evt.text or "", evt.type)
                 end
@@ -510,7 +583,22 @@ local function pollStreamEvents()
     end
     if consumed > 0 then
         streamFilePos = streamFilePos + consumed
+        if isTyping then
+            bdHandleLog("stream consumed records=" .. tostring(records) .. " bytes=" .. tostring(consumed) .. " pos=" .. tostring(streamFilePos))
+        end
     end
+end
+
+local function safePollStreamEvents(source)
+    local ok, err = pcall(pollStreamEvents)
+    if ok then return true end
+
+    local now = hs.timer.secondsSinceEpoch()
+    if now - lastPollErrorAt >= 1.0 then
+        lastPollErrorAt = now
+        bdHandleLog("stream poll error source=" .. tostring(source) .. " err=" .. tostring(err))
+    end
+    return false
 end
 
 -- Start the polling timer (idempotent). Polling runs all the time so we
@@ -527,8 +615,34 @@ local function ensurePolling(resetToEnd)
     end
     if streamPollerRunning() then return end
     if streamPoller then streamPoller:stop() end
-    streamPoller = hs.timer.doEvery(0.03, pollStreamEvents)
+    streamPoller = hs.timer.doEvery(IDLE_POLL_INTERVAL, function()
+        safePollStreamEvents("idle")
+    end)
     bdHandleLog("stream poller started pos=" .. tostring(streamFilePos))
+end
+
+local function activePollerRunning()
+    if not activePoller then return false end
+    local ok, running = pcall(function() return activePoller:running() end)
+    return (not ok) or running == true
+end
+
+local function startActivePoller(reason)
+    if activePollerRunning() then return end
+    if activePoller then activePoller:stop() end
+    activePoller = hs.timer.doEvery(ACTIVE_POLL_INTERVAL, function()
+        safePollStreamEvents("active")
+    end)
+    bdHandleLog("active poller started reason=" .. tostring(reason))
+    safePollStreamEvents("active-start")
+end
+
+local function stopActivePoller(reason)
+    if activePoller then
+        activePoller:stop()
+        activePoller = nil
+        bdHandleLog("active poller stopped reason=" .. tostring(reason))
+    end
 end
 
 local function beginTyping()
@@ -538,6 +652,7 @@ local function beginTyping()
         bdHandleLog("end grace canceled reason=resume typing")
         pressedAt = hs.timer.secondsSinceEpoch() - HOLD_THRESHOLD - 0.01
         state = "rec_hold"
+        startActivePoller("resume")
         syncMenubar()
         return
     end
@@ -553,13 +668,18 @@ local function beginTyping()
     segmentClosed = false
     targetApp = hs.application.frontmostApplication()
     isTyping = true
+    bdHandleLog("begin typing pos=" .. tostring(streamFilePos))
     syncMenubar()
-    hs.timer.doAfter(0.02, pollStreamEvents)
+    startActivePoller("begin")
+    hs.timer.doAfter(0.02, function()
+        safePollStreamEvents("begin-delay")
+    end)
 end
 
 local function endTyping()
     flushPendingRevision("end typing", true)
     isTyping = false
+    stopActivePoller("end typing")
     -- Capture what we typed so the glossary pass can compute a diff
     -- before we clear state.
     local original = typedText
@@ -586,6 +706,28 @@ local function endTyping()
         end
     end
     syncMenubar()
+end
+
+_G.bdDebugState = function()
+    local idleRunning = streamPollerRunning()
+    local activeRunning = activePollerRunning()
+    local title = "nil"
+    local inMenu = "nil"
+    if bdMenubar then
+        local okTitle, gotTitle = pcall(function() return bdMenubar:title() end)
+        if okTitle then title = tostring(gotTitle) end
+        local okMenu, gotMenu = pcall(function() return bdMenubar:isInMenuBar() end)
+        if okMenu then inMenu = tostring(gotMenu) end
+    end
+    return string.format(
+        "state=%s isTyping=%s rcmdDown=%s pos=%s idlePoller=%s activePoller=%s menubarInMenu=%s menubarTitle=%s",
+        tostring(state), tostring(isTyping), tostring(rcmdDown), tostring(streamFilePos),
+        tostring(idleRunning), tostring(activeRunning), inMenu, title
+    )
+end
+
+_G.bdForceStreamPoll = function()
+    return safePollStreamEvents("manual")
 end
 
 finishPendingEnd = function(reason)
