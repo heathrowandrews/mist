@@ -599,12 +599,9 @@ local function bdLog(msg)
     end
 end
 
--- Accept either Right-⌘ (kc=54) or Left-⌘ (kc=55). Some keyboards / Karabiner
--- setups send kc=55 for the physical Right-⌘ key; rather than fight it, we
--- bind to both. Trade-off: a quick ⌘+letter shortcut could briefly enter
--- dictation mode (≤500 ms hold) — ⌃⌥⌘Escape always bails out.
-local KEY_LEFT_CMD = 55
-local function isCmdHotkey(kc) return kc == KEY_RIGHT_CMD or kc == KEY_LEFT_CMD end
+-- Only Right-⌘ owns dictation. Letting Left-⌘ in here makes normal app
+-- shortcuts look like dictation attempts.
+local function isCmdHotkey(kc) return kc == KEY_RIGHT_CMD end
 
 bdTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
     local kc = event:getKeyCode()
