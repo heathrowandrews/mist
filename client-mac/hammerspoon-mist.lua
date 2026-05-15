@@ -427,6 +427,7 @@ local mistTimer = nil
 local mistBirth = 0
 local mistMode = "text"
 local mistSeeds = {}
+local mistAnchorFrame = nil
 
 local function rectFromAX(value)
     if type(value) ~= "table" then return nil end
@@ -435,14 +436,52 @@ local function rectFromAX(value)
     local w = value.w or value.width or value.W or value[3]
     local h = value.h or value.height or value.H or value[4]
     if type(x) == "number" and type(y) == "number" then
-        return { x = x, y = y, w = tonumber(w) or 2, h = tonumber(h) or 18 }
+        local ww = tonumber(w) or 2
+        local hh = tonumber(h) or 18
+        if hh <= 0 then return nil end
+        if ww <= 0 then ww = 2 end
+        return { x = x, y = y, w = ww, h = hh }
     end
     return nil
 end
 
-local function focusedCaretFrame()
+local function focusedAXElement()
+    if hs.axuielement then
+        local apps = {}
+        if targetApp then apps[#apps + 1] = targetApp end
+        local front = hs.application.frontmostApplication()
+        if front and front ~= targetApp then apps[#apps + 1] = front end
+
+        for _, app in ipairs(apps) do
+            local okApp, appElem = pcall(function()
+                return hs.axuielement.applicationElement(app)
+            end)
+            if okApp and appElem then
+                local okFocused, focused = pcall(function()
+                    return appElem:attributeValue("AXFocusedUIElement")
+                end)
+                if okFocused and focused then return focused end
+            end
+        end
+
+        local okSystem, system = pcall(hs.axuielement.systemWideElement)
+        if okSystem and system then
+            local okFocused, focused = pcall(function()
+                return system:attributeValue("AXFocusedUIElement")
+            end)
+            if okFocused and focused then return focused end
+        end
+    end
+
     local okElem, elem = pcall(hs.uielement.focusedElement)
-    if not okElem or not elem then return nil end
+    if okElem and elem then return elem end
+    return nil
+end
+
+local function focusedCaretFrame()
+    local elem = focusedAXElement()
+    if not elem then return nil end
+    if type(elem.attributeValue) ~= "function" then return nil end
 
     local okRange, range = pcall(function()
         return elem:attributeValue("AXSelectedTextRange")
@@ -465,10 +504,10 @@ local function focusedCaretFrame()
         return elem:attributeValue("AXFrame")
     end)
     local rect = okFrame and rectFromAX(frame) or nil
-    if rect then
+    if rect and rect.w >= 8 and rect.h >= 8 then
         return {
-            x = rect.x + math.min(math.max(rect.w - 36, 12), 36),
-            y = rect.y + math.max(rect.h - 28, 8),
+            x = rect.x + math.min(math.max(rect.w - 36, 18), math.max(18, rect.w - 18)),
+            y = rect.y + math.min(math.max(rect.h - 26, 10), math.max(10, rect.h - 10)),
             w = 2,
             h = math.min(rect.h, 24),
         }
@@ -476,21 +515,34 @@ local function focusedCaretFrame()
     return nil
 end
 
+local function captureMistAnchor()
+    local caret = focusedCaretFrame()
+    if caret then
+        mistAnchorFrame = caret
+        return true
+    end
+    return mistAnchorFrame ~= nil
+end
+
 local function positionMistCanvas()
-    if not mistCanvas then return end
+    if not mistCanvas then return false end
     local screen = hs.screen.mainScreen()
-    if not screen then return end
+    if not screen then return false end
     local sf = screen:frame()
     local caret = focusedCaretFrame()
-    if not caret then
-        caret = { x = sf.x + (sf.w / 2), y = sf.y + 18, w = 2, h = 18 }
+    if caret then
+        mistAnchorFrame = caret
+    else
+        caret = mistAnchorFrame
     end
+    if not caret then return false end
 
     local x = caret.x - 32
     local y = caret.y + (caret.h / 2) - (MIST_H / 2)
     x = math.max(sf.x + 8, math.min(x, sf.x + sf.w - MIST_W - 8))
     y = math.max(sf.y + 8, math.min(y, sf.y + sf.h - MIST_H - 8))
     mistCanvas:frame({ x = x, y = y, w = MIST_W, h = MIST_H })
+    return true
 end
 
 local function mistColorWithAlpha(color, alpha)
@@ -551,7 +603,10 @@ end
 
 local function renderMistFrame()
     if not mistCanvas then return end
-    positionMistCanvas()
+    if not positionMistCanvas() then
+        stopMistBurst()
+        return
+    end
     local elapsed = hs.timer.secondsSinceEpoch() - mistBirth
     local duration = (mistMode == "correction") and 0.72 or 0.58
 
@@ -580,11 +635,16 @@ end
 
 local function sparkleMist(mode)
     if not MIST_ANIMATION_ENABLED then return end
+    if not captureMistAnchor() then
+        bdHandleLog("mist sparkle skipped: no text-field anchor")
+        return
+    end
     ensureMistCanvas()
     if not mistCanvas then return end
     mistMode = mode or "text"
     mistBirth = hs.timer.secondsSinceEpoch()
     buildMistSeeds(mistMode)
+    if not positionMistCanvas() then return end
     mistCanvas:show()
     if mistTimer then mistTimer:stop() end
     mistTimer = hs.timer.doEvery(0.025, renderMistFrame)
@@ -1004,6 +1064,7 @@ local function resetDictateState(reason)
     sessionTypedAny = false
     segmentClosed = false
     targetApp = nil
+    mistAnchorFrame = nil
     bridgeSpaceAtSessionStart = false
     typingStartedAt = 0
     typingStateChangedAt = hs.timer.secondsSinceEpoch()
@@ -1031,13 +1092,14 @@ local function beginTyping()
     ensureStreamerRunning()
     ensurePolling(true)
     cancelPendingRevision("begin typing")
+    targetApp = hs.application.frontmostApplication()
+    captureMistAnchor()
     bridgeSpaceAtSessionStart = focusedTextNeedsBridgeSpace()
     priorSessionEndedWithContent = false
     baselinePartial = ""
     typedText = ""
     sessionTypedAny = false   -- reset so the first letter gets capitalized
     segmentClosed = false
-    targetApp = hs.application.frontmostApplication()
     isTyping = true
     typingStartedAt = hs.timer.secondsSinceEpoch()
     typingStateChangedAt = typingStartedAt
@@ -1059,10 +1121,10 @@ local function endTyping()
     -- before we clear state.
     local original = currentSegmentText()
     local app = targetApp
+    targetApp = app
     typedText = ""
     baselinePartial = ""
     segmentClosed = false
-    targetApp = nil
     bridgeSpaceAtSessionStart = false
     typingStartedAt = 0
     typingStateChangedAt = hs.timer.secondsSinceEpoch()
@@ -1079,9 +1141,10 @@ local function endTyping()
             targetApp = app
             bdHandleLog("glossary correction len=" .. #original .. " -> " .. #corrected)
             applyCorrection(original, corrected)
-            targetApp = nil
         end
     end
+    targetApp = nil
+    mistAnchorFrame = nil
     syncMenubar()
 end
 
@@ -1116,11 +1179,30 @@ _G.bdResetDictate = function(reason)
 end
 
 _G.bdPreviewMist = function()
+    targetApp = hs.application.frontmostApplication()
+    mistAnchorFrame = nil
+    if not captureMistAnchor() then
+        targetApp = nil
+        return "no focused text-field anchor for sparkles"
+    end
     startMistAnimation("preview")
     hs.timer.doAfter(0.18, mistCorrectionPing)
     hs.timer.doAfter(0.38, function() startMistAnimation("preview") end)
-    hs.timer.doAfter(1.2, stopMistAnimation)
+    hs.timer.doAfter(1.2, function()
+        stopMistAnimation()
+        targetApp = nil
+        mistAnchorFrame = nil
+    end)
     return "previewing text-field sparkles"
+end
+
+_G.bdMistAnchorDebug = function()
+    targetApp = hs.application.frontmostApplication()
+    local ok = captureMistAnchor()
+    local a = mistAnchorFrame
+    targetApp = nil
+    if not ok or not a then return "no focused text-field anchor" end
+    return string.format("anchor x=%.0f y=%.0f w=%.0f h=%.0f", a.x, a.y, a.w, a.h)
 end
 
 finishPendingEnd = function(reason)
