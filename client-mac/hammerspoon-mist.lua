@@ -404,23 +404,31 @@ end
 -- Text-field mist sparkles: quick, click-through bursts anchored to the
 -- focused caret when text lands or gets corrected.
 local MIST_ANIMATION_ENABLED = true
-local MIST_W = 142
-local MIST_H = 64
+local MIST_W = 108
+local MIST_H = 42
 local MIST_COLOR = { red = 93/255, green = 214/255, blue = 255/255 }
 local MIST_LILAC = { red = 174/255, green = 143/255, blue = 255/255 }
 local MIST_MINT = { red = 116/255, green = 255/255, blue = 214/255 }
 local MIST_WHITE = { red = 1, green = 1, blue = 1 }
 local MIST_SPARKLES = {
-    { x = 30, y = 33, dx = -13, dy = -13, size = 5.8, delay = 0.00, alpha = 0.80 },
-    { x = 44, y = 24, dx = -5,  dy = -18, size = 4.2, delay = 0.03, alpha = 0.72 },
-    { x = 54, y = 38, dx = 5,   dy = -16, size = 7.0, delay = 0.01, alpha = 0.68 },
-    { x = 69, y = 28, dx = 16,  dy = -13, size = 4.8, delay = 0.06, alpha = 0.76 },
-    { x = 81, y = 41, dx = 23,  dy = -9,  size = 6.2, delay = 0.08, alpha = 0.62 },
-    { x = 91, y = 25, dx = 28,  dy = -18, size = 3.8, delay = 0.12, alpha = 0.66 },
-    { x = 35, y = 43, dx = -16, dy = 3,   size = 3.6, delay = 0.10, alpha = 0.56 },
-    { x = 62, y = 20, dx = 3,   dy = -24, size = 3.2, delay = 0.14, alpha = 0.62 },
-    { x = 74, y = 34, dx = 12,  dy = 3,   size = 3.5, delay = 0.16, alpha = 0.50 },
-    { x = 101, y = 35, dx = 25, dy = -2,  size = 3.0, delay = 0.18, alpha = 0.46 },
+    { x = 13, y = 23, dx = -6, dy = -7,  size = 1.8, delay = 0.00, alpha = 0.58 },
+    { x = 19, y = 17, dx = -3, dy = -10, size = 1.4, delay = 0.02, alpha = 0.48 },
+    { x = 24, y = 27, dx = 2,  dy = -8,  size = 2.2, delay = 0.01, alpha = 0.54 },
+    { x = 31, y = 19, dx = 6,  dy = -10, size = 1.5, delay = 0.05, alpha = 0.50 },
+    { x = 38, y = 24, dx = 9,  dy = -7,  size = 1.9, delay = 0.04, alpha = 0.44 },
+    { x = 44, y = 16, dx = 12, dy = -11, size = 1.2, delay = 0.08, alpha = 0.42 },
+    { x = 51, y = 25, dx = 15, dy = -6,  size = 1.7, delay = 0.07, alpha = 0.44 },
+    { x = 57, y = 20, dx = 18, dy = -9,  size = 1.3, delay = 0.10, alpha = 0.40 },
+    { x = 63, y = 29, dx = 20, dy = -3,  size = 1.6, delay = 0.11, alpha = 0.36 },
+    { x = 70, y = 18, dx = 22, dy = -10, size = 1.1, delay = 0.14, alpha = 0.38 },
+    { x = 76, y = 25, dx = 23, dy = -5,  size = 1.5, delay = 0.15, alpha = 0.34 },
+    { x = 83, y = 21, dx = 22, dy = -8,  size = 1.0, delay = 0.18, alpha = 0.30 },
+    { x = 17, y = 31, dx = -5, dy = 2,   size = 1.1, delay = 0.09, alpha = 0.32 },
+    { x = 29, y = 13, dx = 1,  dy = -13, size = 1.0, delay = 0.12, alpha = 0.34 },
+    { x = 46, y = 31, dx = 12, dy = 1,   size = 1.1, delay = 0.16, alpha = 0.28 },
+    { x = 60, y = 13, dx = 14, dy = -12, size = 0.9, delay = 0.19, alpha = 0.30 },
+    { x = 72, y = 31, dx = 20, dy = -1,  size = 1.0, delay = 0.21, alpha = 0.26 },
+    { x = 91, y = 23, dx = 18, dy = -5,  size = 0.9, delay = 0.23, alpha = 0.24 },
 }
 local mistCanvas = nil
 local mistTimer = nil
@@ -505,11 +513,29 @@ local function focusedCaretFrame()
     end)
     local rect = okFrame and rectFromAX(frame) or nil
     if rect and rect.w >= 8 and rect.h >= 8 then
+        local location = nil
+        if type(range) == "table" then
+            location = range.location or range.loc
+        end
+        if type(location) == "number" then
+            local usableW = math.max(24, rect.w - 32)
+            local approxCharW = 7.4
+            local approxLineH = math.min(22, math.max(16, rect.h - 12))
+            local charsPerLine = math.max(8, math.floor(usableW / approxCharW))
+            local line = math.floor(math.max(0, location) / charsPerLine)
+            local col = math.max(0, location) % charsPerLine
+            return {
+                x = rect.x + 16 + math.min(usableW, col * approxCharW),
+                y = rect.y + math.min(rect.h - 8, 10 + (line * approxLineH)),
+                w = 2,
+                h = math.min(rect.h, 20),
+            }
+        end
         return {
-            x = rect.x + math.min(math.max(rect.w - 36, 18), math.max(18, rect.w - 18)),
-            y = rect.y + math.min(math.max(rect.h - 26, 10), math.max(10, rect.h - 10)),
+            x = rect.x + 16,
+            y = rect.y + math.max(8, (rect.h / 2) - 9),
             w = 2,
-            h = math.min(rect.h, 24),
+            h = math.min(rect.h, 20),
         }
     end
     return nil
@@ -537,7 +563,7 @@ local function positionMistCanvas()
     end
     if not caret then return false end
 
-    local x = caret.x - 32
+    local x = caret.x - 8
     local y = caret.y + (caret.h / 2) - (MIST_H / 2)
     x = math.max(sf.x + 8, math.min(x, sf.x + sf.w - MIST_W - 8))
     y = math.max(sf.y + 8, math.min(y, sf.y + sf.h - MIST_H - 8))
