@@ -58,6 +58,9 @@ local segmentClosed     = false    -- final event seen; next partial is a fresh 
 local targetApp         = nil      -- app that owned focus when dictation began
 local priorSessionEndedWithContent = false   -- previous dictation ended with non-space content; new session should prepend a space
 local bridgeSpaceAtSessionStart = false
+local startMistAnimation = function() end
+local stopMistAnimation = function() end
+local mistTextPing = function() end
 
 local function completeRecordSize(path)
     local f = io.open(path, "r")
@@ -104,6 +107,7 @@ local function postUnicode(text)
         i = i + chunkSize
         if i <= #text then hs.timer.usleep(3000) end
     end
+    mistTextPing()
 end
 
 -- Auto-capitalize the first letter we type in a session so dictation starts
@@ -386,6 +390,185 @@ local function bdHandleLog(msg)
         f:write(os.date("%H:%M:%S") .. " " .. msg .. "\n")
         f:close()
     end
+end
+
+-- Cursor-near mist: a tiny, non-text overlay that breathes while listening
+-- and ripples when text lands. It follows the focused text caret when AX can
+-- expose bounds, with a focused-element fallback for apps that hide caret
+-- geometry.
+local MIST_ANIMATION_ENABLED = true
+local MIST_W = 118
+local MIST_H = 46
+local MIST_COLOR = { red = 93/255, green = 214/255, blue = 255/255 }
+local MIST_LILAC = { red = 174/255, green = 143/255, blue = 255/255 }
+local MIST_MINT = { red = 116/255, green = 255/255, blue = 214/255 }
+local mistCanvas = nil
+local mistTimer = nil
+local mistPhase = 0
+local mistBoost = 0
+
+local function rectFromAX(value)
+    if type(value) ~= "table" then return nil end
+    local x = value.x or value.X or value[1]
+    local y = value.y or value.Y or value[2]
+    local w = value.w or value.width or value.W or value[3]
+    local h = value.h or value.height or value.H or value[4]
+    if type(x) == "number" and type(y) == "number" then
+        return { x = x, y = y, w = tonumber(w) or 2, h = tonumber(h) or 18 }
+    end
+    return nil
+end
+
+local function focusedCaretFrame()
+    local okElem, elem = pcall(hs.uielement.focusedElement)
+    if not okElem or not elem then return nil end
+
+    local okRange, range = pcall(function()
+        return elem:attributeValue("AXSelectedTextRange")
+    end)
+    if okRange and type(range) == "table" then
+        local location = range.location or range.loc
+        if type(location) == "number" then
+            local okBounds, bounds = pcall(function()
+                return elem:parameterizedAttributeValue("AXBoundsForRange", {
+                    location = location,
+                    length = math.max(1, tonumber(range.length or range.len) or 1),
+                })
+            end)
+            local rect = okBounds and rectFromAX(bounds) or nil
+            if rect then return rect end
+        end
+    end
+
+    local okFrame, frame = pcall(function()
+        return elem:attributeValue("AXFrame")
+    end)
+    local rect = okFrame and rectFromAX(frame) or nil
+    if rect then
+        return {
+            x = rect.x + math.min(math.max(rect.w - 36, 12), 36),
+            y = rect.y + math.max(rect.h - 28, 8),
+            w = 2,
+            h = math.min(rect.h, 24),
+        }
+    end
+    return nil
+end
+
+local function positionMistCanvas()
+    if not mistCanvas then return end
+    local screen = hs.screen.mainScreen()
+    if not screen then return end
+    local sf = screen:frame()
+    local caret = focusedCaretFrame()
+    if not caret then
+        caret = { x = sf.x + (sf.w / 2), y = sf.y + 18, w = 2, h = 18 }
+    end
+
+    local x = caret.x - 26
+    local y = caret.y + (caret.h / 2) - (MIST_H / 2)
+    x = math.max(sf.x + 8, math.min(x, sf.x + sf.w - MIST_W - 8))
+    y = math.max(sf.y + 8, math.min(y, sf.y + sf.h - MIST_H - 8))
+    mistCanvas:frame({ x = x, y = y, w = MIST_W, h = MIST_H })
+end
+
+local function ensureMistCanvas()
+    if mistCanvas then return end
+    mistCanvas = hs.canvas.new({ x = 0, y = 0, w = MIST_W, h = MIST_H })
+    mistCanvas:level(hs.canvas.windowLevels.overlay)
+    mistCanvas:behavior({ "canJoinAllSpaces", "stationary" })
+    pcall(function() mistCanvas:clickActivating(false) end)
+    mistCanvas:appendElements({
+        {
+            type = "rectangle",
+            action = "fill",
+            frame = { x = 18, y = 12, w = 78, h = 22 },
+            roundedRectRadii = { xRadius = 11, yRadius = 11 },
+            fillColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.10 },
+        },
+        {
+            type = "circle",
+            action = "stroke",
+            frame = { x = 4, y = 8, w = 30, h = 30 },
+            strokeWidth = 2,
+            strokeColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.34 },
+        },
+        {
+            type = "circle",
+            action = "fill",
+            frame = { x = 28, y = 15, w = 12, h = 12 },
+            fillColor = { red = MIST_LILAC.red, green = MIST_LILAC.green, blue = MIST_LILAC.blue, alpha = 0.26 },
+        },
+        {
+            type = "circle",
+            action = "fill",
+            frame = { x = 48, y = 10, w = 10, h = 10 },
+            fillColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.22 },
+        },
+        {
+            type = "circle",
+            action = "fill",
+            frame = { x = 66, y = 18, w = 14, h = 14 },
+            fillColor = { red = MIST_MINT.red, green = MIST_MINT.green, blue = MIST_MINT.blue, alpha = 0.20 },
+        },
+        {
+            type = "rectangle",
+            action = "fill",
+            frame = { x = 22, y = 8, w = 3, h = 30 },
+            roundedRectRadii = { xRadius = 1.5, yRadius = 1.5 },
+            fillColor = { red = 1, green = 1, blue = 1, alpha = 0.42 },
+        },
+    })
+    positionMistCanvas()
+end
+
+local function renderMistFrame()
+    if not mistCanvas then return end
+    positionMistCanvas()
+    mistPhase = mistPhase + 0.17
+    local breath = 0.5 + 0.5 * math.sin(mistPhase)
+    local drift = math.sin(mistPhase * 0.7)
+    local pulse = mistBoost
+    mistBoost = math.max(0, mistBoost - 0.055)
+
+    mistCanvas[1].fillColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.07 + breath * 0.07 + pulse * 0.05 }
+    mistCanvas[2].frame = { x = 7 - pulse * 7, y = 11 - pulse * 7, w = 24 + pulse * 18, h = 24 + pulse * 18 }
+    mistCanvas[2].strokeColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.20 + breath * 0.22 + pulse * 0.42 }
+
+    mistCanvas[3].frame = { x = 30 + drift * 3, y = 16 - breath * 3, w = 10 + breath * 3, h = 10 + breath * 3 }
+    mistCanvas[3].fillColor = { red = MIST_LILAC.red, green = MIST_LILAC.green, blue = MIST_LILAC.blue, alpha = 0.18 + breath * 0.16 + pulse * 0.10 }
+    mistCanvas[4].frame = { x = 50 - drift * 2, y = 11 + breath * 4, w = 8 + pulse * 5, h = 8 + pulse * 5 }
+    mistCanvas[4].fillColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.16 + breath * 0.14 + pulse * 0.12 }
+    mistCanvas[5].frame = { x = 68 + drift * 2, y = 18 - breath * 2, w = 12 + breath * 2, h = 12 + breath * 2 }
+    mistCanvas[5].fillColor = { red = MIST_MINT.red, green = MIST_MINT.green, blue = MIST_MINT.blue, alpha = 0.14 + breath * 0.12 + pulse * 0.10 }
+    mistCanvas[6].fillColor = { red = 1, green = 1, blue = 1, alpha = 0.24 + breath * 0.32 + pulse * 0.25 }
+end
+
+startMistAnimation = function(reason)
+    if not MIST_ANIMATION_ENABLED then return end
+    ensureMistCanvas()
+    if not mistCanvas then return end
+    mistBoost = math.max(mistBoost, 0.35)
+    mistCanvas:show()
+    if mistTimer then mistTimer:stop() end
+    mistTimer = hs.timer.doEvery(0.04, renderMistFrame)
+    renderMistFrame()
+    bdHandleLog("mist animation started reason=" .. tostring(reason))
+end
+
+stopMistAnimation = function()
+    if mistTimer then
+        mistTimer:stop()
+        mistTimer = nil
+    end
+    if mistCanvas then mistCanvas:hide() end
+    mistBoost = 0
+end
+
+mistTextPing = function()
+    if not isTyping or not MIST_ANIMATION_ENABLED then return end
+    mistBoost = math.min(1.0, mistBoost + 0.42)
+    if mistCanvas then renderMistFrame() end
 end
 
 local function currentSegmentText()
@@ -784,6 +967,7 @@ local function resetDictateState(reason)
     bridgeSpaceAtSessionStart = false
     typingStartedAt = 0
     typingStateChangedAt = hs.timer.secondsSinceEpoch()
+    stopMistAnimation()
     stopActivePoller("reset")
     syncMenubar()
     bdHandleLog("state reset reason=" .. tostring(reason))
@@ -798,6 +982,7 @@ local function beginTyping()
         pressedAt = hs.timer.secondsSinceEpoch() - HOLD_THRESHOLD - 0.01
         state = "rec_hold"
         typingStateChangedAt = hs.timer.secondsSinceEpoch()
+        startMistAnimation("resume")
         startActivePoller("resume")
         syncMenubar()
         return
@@ -818,6 +1003,7 @@ local function beginTyping()
     typingStateChangedAt = typingStartedAt
     bdHandleLog("begin typing pos=" .. tostring(streamFilePos))
     syncMenubar()
+    startMistAnimation("begin")
     startActivePoller("begin")
     hs.timer.doAfter(0.02, function()
         safePollStreamEvents("begin-delay")
@@ -828,6 +1014,7 @@ local function endTyping()
     flushPendingRevision("end typing", true)
     maybeAppendTerminalPeriod("end typing")
     isTyping = false
+    stopMistAnimation()
     stopActivePoller("end typing")
     -- Capture what we typed so the glossary pass can compute a diff
     -- before we clear state.
@@ -887,6 +1074,12 @@ end
 
 _G.bdResetDictate = function(reason)
     return resetDictateState(reason or "manual")
+end
+
+_G.bdPreviewMist = function()
+    startMistAnimation("preview")
+    hs.timer.doAfter(2.5, stopMistAnimation)
+    return "previewing mist"
 end
 
 finishPendingEnd = function(reason)
