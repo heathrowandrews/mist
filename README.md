@@ -84,7 +84,7 @@ export BLOOM_DICTATE_TENANT=default
 
 - This is not notarized or packaged for general users yet.
 - The hotkey bridge currently depends on Hammerspoon because native Swift event-tap delivery was unreliable during development.
-- The Hammerspoon bridge shows a small cursor-near Mist halo while dictation is active, with a soft ripple each time text lands.
+- The Hammerspoon bridge shows quick text-field sparkle bursts as text lands or gets corrected.
 - Bluetooth headset inputs can be unreliable on macOS when the device stays in high-quality stereo mode. Mist avoids known-problem AirPods/Beats capture inputs and falls back to the built-in mic when available. Set `BLOOM_DICTATE_PREFER_SYSTEM_INPUT=1` to force the macOS default input, or `BLOOM_DICTATE_AUDIO_DEVICE=<name-or-id>` to pick a specific device.
 - `client-mac/mist doctor` checks local health without printing secrets. `client-mac/mist reset` clears Hammerspoon dictation state if a hotkey session ever feels stuck. `client-mac/bd` remains as a compatibility alias for early builds.
 - `scripts/privacy-scan.sh` is the release gate for private paths, raw bearer headers, and token-shaped hex strings.

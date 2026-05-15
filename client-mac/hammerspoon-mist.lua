@@ -61,6 +61,7 @@ local bridgeSpaceAtSessionStart = false
 local startMistAnimation = function() end
 local stopMistAnimation = function() end
 local mistTextPing = function() end
+local mistCorrectionPing = function() end
 
 local function completeRecordSize(path)
     local f = io.open(path, "r")
@@ -273,9 +274,17 @@ local function applyCorrection(original, corrected)
         divergeAt = divergeAt + 1
     end
     local bsCount = #original - divergeAt
-    if bsCount > 0 then backspace(bsCount) end
+    local didSpark = false
+    if bsCount > 0 then
+        mistCorrectionPing()
+        didSpark = true
+        backspace(bsCount)
+    end
     local toType = corrected:sub(divergeAt + 1)
-    if #toType > 0 then postUnicode(toType) end
+    if #toType > 0 then
+        if not didSpark then mistCorrectionPing() end
+        postUnicode(toType)
+    end
 end
 
 local function capitalizeLeadingLetter(text)
@@ -392,20 +401,32 @@ local function bdHandleLog(msg)
     end
 end
 
--- Cursor-near mist: a tiny, non-text overlay that breathes while listening
--- and ripples when text lands. It follows the focused text caret when AX can
--- expose bounds, with a focused-element fallback for apps that hide caret
--- geometry.
+-- Text-field mist sparkles: quick, click-through bursts anchored to the
+-- focused caret when text lands or gets corrected.
 local MIST_ANIMATION_ENABLED = true
-local MIST_W = 118
-local MIST_H = 46
+local MIST_W = 142
+local MIST_H = 64
 local MIST_COLOR = { red = 93/255, green = 214/255, blue = 255/255 }
 local MIST_LILAC = { red = 174/255, green = 143/255, blue = 255/255 }
 local MIST_MINT = { red = 116/255, green = 255/255, blue = 214/255 }
+local MIST_WHITE = { red = 1, green = 1, blue = 1 }
+local MIST_SPARKLES = {
+    { x = 30, y = 33, dx = -13, dy = -13, size = 5.8, delay = 0.00, alpha = 0.80 },
+    { x = 44, y = 24, dx = -5,  dy = -18, size = 4.2, delay = 0.03, alpha = 0.72 },
+    { x = 54, y = 38, dx = 5,   dy = -16, size = 7.0, delay = 0.01, alpha = 0.68 },
+    { x = 69, y = 28, dx = 16,  dy = -13, size = 4.8, delay = 0.06, alpha = 0.76 },
+    { x = 81, y = 41, dx = 23,  dy = -9,  size = 6.2, delay = 0.08, alpha = 0.62 },
+    { x = 91, y = 25, dx = 28,  dy = -18, size = 3.8, delay = 0.12, alpha = 0.66 },
+    { x = 35, y = 43, dx = -16, dy = 3,   size = 3.6, delay = 0.10, alpha = 0.56 },
+    { x = 62, y = 20, dx = 3,   dy = -24, size = 3.2, delay = 0.14, alpha = 0.62 },
+    { x = 74, y = 34, dx = 12,  dy = 3,   size = 3.5, delay = 0.16, alpha = 0.50 },
+    { x = 101, y = 35, dx = 25, dy = -2,  size = 3.0, delay = 0.18, alpha = 0.46 },
+}
 local mistCanvas = nil
 local mistTimer = nil
-local mistPhase = 0
-local mistBoost = 0
+local mistBirth = 0
+local mistMode = "text"
+local mistSeeds = {}
 
 local function rectFromAX(value)
     if type(value) ~= "table" then return nil end
@@ -465,11 +486,22 @@ local function positionMistCanvas()
         caret = { x = sf.x + (sf.w / 2), y = sf.y + 18, w = 2, h = 18 }
     end
 
-    local x = caret.x - 26
+    local x = caret.x - 32
     local y = caret.y + (caret.h / 2) - (MIST_H / 2)
     x = math.max(sf.x + 8, math.min(x, sf.x + sf.w - MIST_W - 8))
     y = math.max(sf.y + 8, math.min(y, sf.y + sf.h - MIST_H - 8))
     mistCanvas:frame({ x = x, y = y, w = MIST_W, h = MIST_H })
+end
+
+local function mistColorWithAlpha(color, alpha)
+    return { red = color.red, green = color.green, blue = color.blue, alpha = alpha }
+end
+
+local function mistSparkleColor(mode, index)
+    local textPalette = { MIST_COLOR, MIST_MINT, MIST_WHITE, MIST_LILAC }
+    local correctionPalette = { MIST_LILAC, MIST_WHITE, MIST_MINT, MIST_COLOR }
+    local palette = (mode == "correction") and correctionPalette or textPalette
+    return palette[((index - 1) % #palette) + 1]
 end
 
 local function ensureMistCanvas()
@@ -478,97 +510,103 @@ local function ensureMistCanvas()
     mistCanvas:level(hs.canvas.windowLevels.overlay)
     mistCanvas:behavior({ "canJoinAllSpaces", "stationary" })
     pcall(function() mistCanvas:clickActivating(false) end)
-    mistCanvas:appendElements({
-        {
-            type = "rectangle",
-            action = "fill",
-            frame = { x = 18, y = 12, w = 78, h = 22 },
-            roundedRectRadii = { xRadius = 11, yRadius = 11 },
-            fillColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.10 },
-        },
-        {
-            type = "circle",
-            action = "stroke",
-            frame = { x = 4, y = 8, w = 30, h = 30 },
-            strokeWidth = 2,
-            strokeColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.34 },
-        },
-        {
+    local elements = {}
+    for _ = 1, #MIST_SPARKLES do
+        elements[#elements + 1] = {
             type = "circle",
             action = "fill",
-            frame = { x = 28, y = 15, w = 12, h = 12 },
-            fillColor = { red = MIST_LILAC.red, green = MIST_LILAC.green, blue = MIST_LILAC.blue, alpha = 0.26 },
-        },
-        {
-            type = "circle",
-            action = "fill",
-            frame = { x = 48, y = 10, w = 10, h = 10 },
-            fillColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.22 },
-        },
-        {
-            type = "circle",
-            action = "fill",
-            frame = { x = 66, y = 18, w = 14, h = 14 },
-            fillColor = { red = MIST_MINT.red, green = MIST_MINT.green, blue = MIST_MINT.blue, alpha = 0.20 },
-        },
-        {
-            type = "rectangle",
-            action = "fill",
-            frame = { x = 22, y = 8, w = 3, h = 30 },
-            roundedRectRadii = { xRadius = 1.5, yRadius = 1.5 },
-            fillColor = { red = 1, green = 1, blue = 1, alpha = 0.42 },
-        },
-    })
+            frame = { x = 0, y = 0, w = 1, h = 1 },
+            fillColor = { red = 1, green = 1, blue = 1, alpha = 0 },
+        }
+    end
+    mistCanvas:appendElements(elements)
     positionMistCanvas()
 end
 
-local function renderMistFrame()
-    if not mistCanvas then return end
-    positionMistCanvas()
-    mistPhase = mistPhase + 0.17
-    local breath = 0.5 + 0.5 * math.sin(mistPhase)
-    local drift = math.sin(mistPhase * 0.7)
-    local pulse = mistBoost
-    mistBoost = math.max(0, mistBoost - 0.055)
-
-    mistCanvas[1].fillColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.07 + breath * 0.07 + pulse * 0.05 }
-    mistCanvas[2].frame = { x = 7 - pulse * 7, y = 11 - pulse * 7, w = 24 + pulse * 18, h = 24 + pulse * 18 }
-    mistCanvas[2].strokeColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.20 + breath * 0.22 + pulse * 0.42 }
-
-    mistCanvas[3].frame = { x = 30 + drift * 3, y = 16 - breath * 3, w = 10 + breath * 3, h = 10 + breath * 3 }
-    mistCanvas[3].fillColor = { red = MIST_LILAC.red, green = MIST_LILAC.green, blue = MIST_LILAC.blue, alpha = 0.18 + breath * 0.16 + pulse * 0.10 }
-    mistCanvas[4].frame = { x = 50 - drift * 2, y = 11 + breath * 4, w = 8 + pulse * 5, h = 8 + pulse * 5 }
-    mistCanvas[4].fillColor = { red = MIST_COLOR.red, green = MIST_COLOR.green, blue = MIST_COLOR.blue, alpha = 0.16 + breath * 0.14 + pulse * 0.12 }
-    mistCanvas[5].frame = { x = 68 + drift * 2, y = 18 - breath * 2, w = 12 + breath * 2, h = 12 + breath * 2 }
-    mistCanvas[5].fillColor = { red = MIST_MINT.red, green = MIST_MINT.green, blue = MIST_MINT.blue, alpha = 0.14 + breath * 0.12 + pulse * 0.10 }
-    mistCanvas[6].fillColor = { red = 1, green = 1, blue = 1, alpha = 0.24 + breath * 0.32 + pulse * 0.25 }
-end
-
-startMistAnimation = function(reason)
-    if not MIST_ANIMATION_ENABLED then return end
-    ensureMistCanvas()
-    if not mistCanvas then return end
-    mistBoost = math.max(mistBoost, 0.35)
-    mistCanvas:show()
-    if mistTimer then mistTimer:stop() end
-    mistTimer = hs.timer.doEvery(0.04, renderMistFrame)
-    renderMistFrame()
-    bdHandleLog("mist animation started reason=" .. tostring(reason))
-end
-
-stopMistAnimation = function()
+local function stopMistBurst()
     if mistTimer then
         mistTimer:stop()
         mistTimer = nil
     end
     if mistCanvas then mistCanvas:hide() end
-    mistBoost = 0
+    mistSeeds = {}
+end
+
+local function buildMistSeeds(mode)
+    mistSeeds = {}
+    local correctionBoost = (mode == "correction") and 1.25 or 1.0
+    for i, pattern in ipairs(MIST_SPARKLES) do
+        mistSeeds[i] = {
+            x = pattern.x,
+            y = pattern.y,
+            dx = pattern.dx * correctionBoost,
+            dy = pattern.dy * correctionBoost,
+            size = pattern.size * correctionBoost,
+            delay = pattern.delay,
+            alpha = math.min(0.9, pattern.alpha * correctionBoost),
+            color = mistSparkleColor(mode, i),
+        }
+    end
+end
+
+local function renderMistFrame()
+    if not mistCanvas then return end
+    positionMistCanvas()
+    local elapsed = hs.timer.secondsSinceEpoch() - mistBirth
+    local duration = (mistMode == "correction") and 0.72 or 0.58
+
+    for i, seed in ipairs(mistSeeds) do
+        local localT = (elapsed - seed.delay) / math.max(0.01, duration - seed.delay)
+        if localT <= 0 then
+            mistCanvas[i].frame = { x = seed.x, y = seed.y, w = 1, h = 1 }
+            mistCanvas[i].fillColor = mistColorWithAlpha(seed.color, 0)
+        else
+            localT = math.min(1, localT)
+            local ease = 1 - ((1 - localT) ^ 3)
+            local pop = math.sin(localT * math.pi)
+            local size = seed.size * (0.55 + (pop * 0.95))
+            local x = seed.x + (seed.dx * ease) - (size / 2)
+            local y = seed.y + (seed.dy * ease) - (size / 2)
+            local alpha = seed.alpha * (1 - localT) * (0.35 + (pop * 0.65))
+            mistCanvas[i].frame = { x = x, y = y, w = size, h = size }
+            mistCanvas[i].fillColor = mistColorWithAlpha(seed.color, alpha)
+        end
+    end
+
+    if elapsed >= duration then
+        stopMistBurst()
+    end
+end
+
+local function sparkleMist(mode)
+    if not MIST_ANIMATION_ENABLED then return end
+    ensureMistCanvas()
+    if not mistCanvas then return end
+    mistMode = mode or "text"
+    mistBirth = hs.timer.secondsSinceEpoch()
+    buildMistSeeds(mistMode)
+    mistCanvas:show()
+    if mistTimer then mistTimer:stop() end
+    mistTimer = hs.timer.doEvery(0.025, renderMistFrame)
+    renderMistFrame()
+end
+
+startMistAnimation = function(reason)
+    if reason == "preview" then sparkleMist("text") end
+end
+
+stopMistAnimation = function()
+    stopMistBurst()
 end
 
 mistTextPing = function()
     if not isTyping or not MIST_ANIMATION_ENABLED then return end
-    mistBoost = math.min(1.0, mistBoost + 0.42)
-    if mistCanvas then renderMistFrame() end
+    sparkleMist("text")
+end
+
+mistCorrectionPing = function()
+    if not MIST_ANIMATION_ENABLED then return end
+    sparkleMist("correction")
 end
 
 local function currentSegmentText()
@@ -670,6 +708,7 @@ local function applyRevision(data, force)
         local toType = targetPartial:sub(keep + 1)
         bdHandleLog("  -> path: full revision apply, keep=" .. keep .. " delete=" .. deleteCount .. " type.len=" .. #toType)
         if deleteCount > 0 then
+            mistCorrectionPing()
             backspace(deleteCount)
         end
         if #toType > 0 then
@@ -687,6 +726,7 @@ local function applyRevision(data, force)
     local toType = newPortion:sub(keep + 1)
     bdHandleLog("  -> path: revision apply, keep=" .. keep .. " delete=" .. deleteCount .. " type.len=" .. #toType)
     if deleteCount > 0 then
+        mistCorrectionPing()
         backspace(deleteCount)
     end
     if #toType > 0 then
@@ -1014,7 +1054,6 @@ local function endTyping()
     flushPendingRevision("end typing", true)
     maybeAppendTerminalPeriod("end typing")
     isTyping = false
-    stopMistAnimation()
     stopActivePoller("end typing")
     -- Capture what we typed so the glossary pass can compute a diff
     -- before we clear state.
@@ -1078,8 +1117,10 @@ end
 
 _G.bdPreviewMist = function()
     startMistAnimation("preview")
-    hs.timer.doAfter(2.5, stopMistAnimation)
-    return "previewing mist"
+    hs.timer.doAfter(0.18, mistCorrectionPing)
+    hs.timer.doAfter(0.38, function() startMistAnimation("preview") end)
+    hs.timer.doAfter(1.2, stopMistAnimation)
+    return "previewing text-field sparkles"
 end
 
 finishPendingEnd = function(reason)
