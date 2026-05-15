@@ -1,5 +1,5 @@
 #!/bin/bash
-# bd — Bloom Dictate CLI. STREAMING client.
+# bd — Mist CLI. STREAMING client.
 #
 # bd start: starts ffmpeg segment muxer (5s WAV chunks) AND a stream worker
 #           that POSTs each closed chunk to the daemon and appends a JSON
@@ -16,6 +16,8 @@
 #   bd stop
 #   bd cancel     # stop without finalizing/accumulating
 #   bd status     # state + elapsed
+#   bd doctor     # health check daemon, streamer, Hammerspoon, repo
+#   bd reset      # reset Hammerspoon dictation state without killing streamer
 #   bd devices    # list AVFoundation audio devices
 #   bd test FILE  # non-streaming single-file transcribe (smoke test)
 #
@@ -54,6 +56,14 @@ fi
 : "${BD_MAX_SECONDS:=600}"
 : "${BD_SEGMENT_SECONDS:=3}"
 
+HS_BIN="${BD_HS_BIN:-}"
+if [ -z "$HS_BIN" ]; then
+    HS_BIN=$(command -v hs 2>/dev/null || true)
+fi
+if [ -z "$HS_BIN" ] && [ -x /opt/homebrew/bin/hs ]; then
+    HS_BIN=/opt/homebrew/bin/hs
+fi
+
 notify() {
     local title="$1"
     local msg="$2"
@@ -84,7 +94,7 @@ cmd_devices() {
 cmd_start() {
     if is_recording; then
         echo "bd: already recording"
-        notify "Bloom Dictate" "Already recording"
+        notify "Mist" "Already recording"
         return 0
     fi
     require_token
@@ -115,7 +125,7 @@ cmd_start() {
     echo "$wpid" > "$WORKER_PIDFILE"
 
     echo "bd: recording (ffmpeg=$pid worker=$wpid) chunks=${BD_SEGMENT_SECONDS}s"
-    notify "Bloom Dictate" "Streaming…"
+    notify "Mist" "Streaming..."
 }
 
 cmd_stop() {
@@ -154,10 +164,10 @@ cmd_stop() {
         local full
         full=$(jq -r '.text' "$EVENTS" | awk 'BEGIN{ORS=" "} {print}' | sed -E 's/[[:space:]]+$//')
         printf '%s' "$full" | pbcopy
-        notify "Bloom Dictate" "Done · ${elapsed}s"
+        notify "Mist" "Done · ${elapsed}s"
         echo "bd: done. ${#full} chars on clipboard."
     else
-        notify "Bloom Dictate" "No speech detected"
+        notify "Mist" "No speech detected"
         echo "bd: no events" >&2
     fi
 }
@@ -181,7 +191,7 @@ cmd_cancel() {
     rm -f "$SEG_DIR"/seg-*.wav
     : > "$EVENTS"
 
-    notify "Bloom Dictate" "Cancelled"
+    notify "Mist" "Cancelled"
     echo "bd: cancelled"
 }
 
@@ -199,6 +209,113 @@ cmd_status() {
     fi
 }
 
+doctor_rc=0
+doctor_info() { printf 'info %s\n' "$1"; }
+doctor_ok() { printf 'ok   %s\n' "$1"; }
+doctor_warn() {
+    printf 'warn %s\n' "$1"
+    if [ "$doctor_rc" -eq 0 ]; then doctor_rc=1; fi
+}
+doctor_fail() {
+    printf 'fail %s\n' "$1"
+    doctor_rc=2
+}
+
+have_hs() {
+    [ -n "$HS_BIN" ] && { [ -x "$HS_BIN" ] || command -v "$HS_BIN" >/dev/null 2>&1; }
+}
+
+cmd_reset() {
+    if ! have_hs; then
+        echo "bd: Hammerspoon CLI not found (install hs or set BD_HS_BIN)" >&2
+        return 1
+    fi
+    "$HS_BIN" -c 'if bdResetDictate then print(bdResetDictate("bd reset")) else print("bdResetDictate unavailable") end'
+}
+
+cmd_doctor() {
+    doctor_rc=0
+
+    if [ -n "$BLOOM_DICTATE_TOKEN" ]; then
+        doctor_ok "token configured"
+    else
+        doctor_fail "BLOOM_DICTATE_TOKEN missing"
+    fi
+
+    local health
+    health=$(curl -fsS --max-time 5 "$BLOOM_DICTATE_URL/health" 2>/dev/null || true)
+    if printf '%s' "$health" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
+        if command -v jq >/dev/null 2>&1; then
+            doctor_ok "daemon health $(printf '%s' "$health" | jq -r '"model=\(.model) tenants=\(.tenants_loaded|join(",")) uptime=\(.uptime_seconds)s"')"
+        else
+            doctor_ok "daemon health ok"
+        fi
+    else
+        doctor_fail "daemon health failed at $BLOOM_DICTATE_URL/health"
+    fi
+
+    if pgrep -f '(Mist|BloomDictate).*--streamer' >/dev/null 2>&1; then
+        doctor_ok "streamer running"
+    else
+        doctor_fail "streamer not running"
+    fi
+
+    local app_log="$BD_STATE_DIR/dictate-app.log"
+    if [ -s "$app_log" ]; then
+        local now mtime age
+        now=$(date +%s)
+        mtime=$(stat -f %m "$app_log" 2>/dev/null || echo 0)
+        age=$((now - mtime))
+        if [ "$age" -le 20 ]; then
+            doctor_ok "streamer log fresh (${age}s)"
+        else
+            doctor_warn "streamer log stale (${age}s)"
+        fi
+    else
+        doctor_warn "streamer log missing"
+    fi
+
+    if pgrep -x Hammerspoon >/dev/null 2>&1; then
+        doctor_ok "Hammerspoon running"
+    else
+        doctor_fail "Hammerspoon not running"
+    fi
+
+    if have_hs; then
+        local hs_state
+        hs_state=$("$HS_BIN" -c 'local ok,tap=pcall(function() return bdTap and bdTap:isEnabled() or false end); print("tap="..tostring(ok and tap)); if bdDebugState then print(bdDebugState()) else print("bdDebugState unavailable") end' 2>&1 || true)
+        if printf '%s\n' "$hs_state" | grep -q 'tap=true'; then
+            doctor_ok "Hammerspoon eventtap enabled"
+        else
+            doctor_fail "Hammerspoon eventtap not enabled"
+        fi
+        printf '%s\n' "$hs_state" | sed 's/^/     /'
+        if printf '%s\n' "$hs_state" | grep -q 'state=rec_locked'; then
+            doctor_warn "dictation is locked; run 'bd reset' if that was not intentional"
+        fi
+    else
+        doctor_warn "Hammerspoon CLI unavailable; cannot inspect eventtap"
+    fi
+
+    local repo="${BLOOM_DICTATE_REPO:-}"
+    if [ -z "$repo" ]; then
+        local script_dir
+        script_dir=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd || true)
+        if [ -n "$script_dir" ] && [ -d "$script_dir/../.git" ]; then
+            repo=$(CDPATH= cd "$script_dir/.." && pwd)
+        fi
+    fi
+    if [ -d "$repo/.git" ]; then
+        if [ -z "$(git -C "$repo" status --porcelain)" ]; then
+            doctor_ok "repo clean"
+        else
+            doctor_info "repo has local changes"
+        fi
+    fi
+
+    return "$doctor_rc"
+}
+
 # Legacy single-file transcribe path — used by `bd test FILE` for smoke
 # testing. NOT used by the streaming hotkey path.
 cmd_test() {
@@ -209,9 +326,9 @@ cmd_test() {
     fi
     require_token
     local resp
-    resp=$(curl -sS --max-time 60 \
+    resp=$(printf 'Authorization: Bearer %s\n' "$BLOOM_DICTATE_TOKEN" | curl -sS --max-time 60 \
         -X POST "$BLOOM_DICTATE_URL/transcribe" \
-        -H "Authorization: Bearer $BLOOM_DICTATE_TOKEN" \
+        -H @- \
         -F "audio=@$file" \
         -F "tenant_id=$BLOOM_DICTATE_TENANT" \
         -F "mode=raw")
@@ -231,6 +348,8 @@ main() {
         stop)    cmd_stop ;;
         cancel)  cmd_cancel ;;
         status)  cmd_status ;;
+        doctor)  cmd_doctor ;;
+        reset)   cmd_reset ;;
         devices) cmd_devices ;;
         test)    shift; cmd_test "${1:-}" ;;
         -h|--help|help) sed -n '2,30p' "$0" ;;

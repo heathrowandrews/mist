@@ -1,6 +1,6 @@
--- Bloom Dictate (SFSpeech hybrid)
+-- Mist (SFSpeech hybrid, powered by Bloom)
 --
--- BloomDictate.app runs in --streamer mode (always-on SFSpeech recognition,
+-- Mist.app runs in --streamer mode (always-on SFSpeech recognition,
 -- 100% on-device via Apple's on-device speech engine) and appends partial
 -- transcripts to ~/.bloom-dictate/dictate-stream.jsonl. Hammerspoon owns
 -- the hotkey + keystroke output:
@@ -35,6 +35,8 @@ local CHIME_SOUNDS       = {
 local state             = "idle"
 local rcmdDown          = false
 local pressedAt         = 0
+local typingStartedAt   = 0
+local typingStateChangedAt = hs.timer.secondsSinceEpoch()
 local pendingStopTimer  = nil
 local pendingRevisionTimer = nil
 local pendingRevision   = nil
@@ -193,7 +195,7 @@ local function backspace(count)
     end
 end
 
--- Bloom glossary: instant local find-replace pass that fires on release.
+-- Mist glossary: instant local find-replace pass that fires on release.
 -- SFSpeech doesn't know project-specific proper nouns ("open claw" instead
 -- of "OpenClaw", etc.). After dictation ends, we run the typed text through
 -- these patterns, diff against what we typed, and silently backspace +
@@ -209,7 +211,8 @@ local GLOSSARY_REPLACEMENTS = {
     { "openclaw",   "OpenClaw" },
     { "voice box",  "VoiceBox" },
     { "answer host","AnswerHost" },
-    { "bloom dictate", "Bloom Dictate" },
+    { "bloom dictate", "Mist" },
+    { "mist dictate", "Mist" },
     { "hot key",    "hotkey" },
     { "hockey key", "hotkey" },
     { "right command", "Right Command" },
@@ -309,12 +312,20 @@ local function typeFreshPartial(partial)
     typedText = ""
 end
 
--- Auto-launch BloomDictate.app --streamer if it's not running
+-- Auto-launch Mist.app --streamer if it's not running. BloomDictate.app is
+-- supported as a compatibility fallback for early local builds.
 local function ensureStreamerRunning()
-    local out, ok = hs.execute("pgrep -f 'BloomDictate.*--streamer' >/dev/null && echo yes || echo no")
+    local out, ok = hs.execute("pgrep -f '(Mist|BloomDictate).*--streamer' >/dev/null && echo yes || echo no")
     if (out or ""):find("yes") then return end
+    local appPath = os.getenv("HOME") .. "/Applications/Mist.app"
+    local f = io.open(appPath .. "/Contents/Info.plist", "r")
+    if f then
+        f:close()
+    else
+        appPath = os.getenv("HOME") .. "/Applications/BloomDictate.app"
+    end
     hs.task.new("/usr/bin/open", nil,
-        { os.getenv("HOME") .. "/Applications/BloomDictate.app", "--args", "--streamer" }
+        { appPath, "--args", "--streamer" }
     ):start()
 end
 
@@ -329,10 +340,10 @@ local function bdSetMenubar(recording)
     end
     if recording then
         bdMenubar:setTitle("🎙")
-        bdMenubar:setTooltip("Bloom Dictate · recording")
+        bdMenubar:setTooltip("Mist · recording")
     else
         bdMenubar:setTitle("🌱")
-        bdMenubar:setTooltip("Bloom Dictate · hold Right-⌘ or double-tap to lock")
+        bdMenubar:setTooltip("Mist · hold Right-⌘ or double-tap to lock")
     end
 end
 bdSetMenubar(false)
@@ -755,6 +766,30 @@ local function stopActivePoller(reason)
     end
 end
 
+local function resetDictateState(reason)
+    cancelPending()
+    cancelPendingRevision("reset")
+    if pendingEndTimer then
+        pendingEndTimer:stop()
+        pendingEndTimer = nil
+    end
+    rcmdDown = false
+    state = "idle"
+    isTyping = false
+    baselinePartial = ""
+    typedText = ""
+    sessionTypedAny = false
+    segmentClosed = false
+    targetApp = nil
+    bridgeSpaceAtSessionStart = false
+    typingStartedAt = 0
+    typingStateChangedAt = hs.timer.secondsSinceEpoch()
+    stopActivePoller("reset")
+    syncMenubar()
+    bdHandleLog("state reset reason=" .. tostring(reason))
+    return "reset ok: " .. tostring(reason or "manual")
+end
+
 local function beginTyping()
     if pendingEndTimer and isTyping then
         pendingEndTimer:stop()
@@ -762,6 +797,7 @@ local function beginTyping()
         bdHandleLog("end grace canceled reason=resume typing")
         pressedAt = hs.timer.secondsSinceEpoch() - HOLD_THRESHOLD - 0.01
         state = "rec_hold"
+        typingStateChangedAt = hs.timer.secondsSinceEpoch()
         startActivePoller("resume")
         syncMenubar()
         return
@@ -778,6 +814,8 @@ local function beginTyping()
     segmentClosed = false
     targetApp = hs.application.frontmostApplication()
     isTyping = true
+    typingStartedAt = hs.timer.secondsSinceEpoch()
+    typingStateChangedAt = typingStartedAt
     bdHandleLog("begin typing pos=" .. tostring(streamFilePos))
     syncMenubar()
     startActivePoller("begin")
@@ -800,6 +838,8 @@ local function endTyping()
     segmentClosed = false
     targetApp = nil
     bridgeSpaceAtSessionStart = false
+    typingStartedAt = 0
+    typingStateChangedAt = hs.timer.secondsSinceEpoch()
 
     -- Remember whether this session left non-space content on screen so
     -- the next session can prepend a space when it starts typing.
@@ -822,6 +862,9 @@ end
 _G.bdDebugState = function()
     local idleRunning = streamPollerRunning()
     local activeRunning = activePollerRunning()
+    local now = hs.timer.secondsSinceEpoch()
+    local typingAge = typingStartedAt > 0 and (now - typingStartedAt) or 0
+    local stateAge = now - typingStateChangedAt
     local title = "nil"
     local inMenu = "nil"
     if bdMenubar then
@@ -831,14 +874,19 @@ _G.bdDebugState = function()
         if okMenu then inMenu = tostring(gotMenu) end
     end
     return string.format(
-        "state=%s isTyping=%s rcmdDown=%s pos=%s idlePoller=%s activePoller=%s menubarInMenu=%s menubarTitle=%s",
-        tostring(state), tostring(isTyping), tostring(rcmdDown), tostring(streamFilePos),
+        "state=%s isTyping=%s rcmdDown=%s typingAge=%.1f stateAge=%.1f pendingEnd=%s pos=%s idlePoller=%s activePoller=%s menubarInMenu=%s menubarTitle=%s",
+        tostring(state), tostring(isTyping), tostring(rcmdDown), typingAge, stateAge,
+        tostring(pendingEndTimer ~= nil), tostring(streamFilePos),
         tostring(idleRunning), tostring(activeRunning), inMenu, title
     )
 end
 
 _G.bdForceStreamPoll = function()
     return safePollStreamEvents("manual")
+end
+
+_G.bdResetDictate = function(reason)
+    return resetDictateState(reason or "manual")
 end
 
 finishPendingEnd = function(reason)
@@ -892,17 +940,20 @@ bdTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
         if state == "idle" then
             pressedAt = t
             state = "rec_hold"
+            typingStateChangedAt = t
             beginTyping()
             playChime("start")
             syncMenubar()
         elseif state == "tap_pending" then
             cancelPending()
             state = "rec_locked"
+            typingStateChangedAt = t
             playChime("lock")
             hs.alert.show("🎙 locked · tap Right-⌘ to stop", 1.5)
             syncMenubar()
         elseif state == "rec_locked" then
             state = "idle"
+            typingStateChangedAt = t
             scheduleEndTyping("locked stop")
             playChime("stop")
             syncMenubar()
@@ -913,9 +964,11 @@ bdTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
             local heldFor = t - pressedAt
             if heldFor < HOLD_THRESHOLD then
                 state = "tap_pending"
+                typingStateChangedAt = t
                 pendingStopTimer = hs.timer.doAfter(DOUBLE_TAP_WINDOW, function()
                     if state == "tap_pending" then
                         state = "idle"
+                        typingStateChangedAt = hs.timer.secondsSinceEpoch()
                         endTyping()
                         playChime("stop")
                         syncMenubar()
@@ -924,6 +977,7 @@ bdTap = hs.eventtap.new({hs.eventtap.event.types.flagsChanged}, function(event)
                 end)
             else
                 state = "idle"
+                typingStateChangedAt = t
                 scheduleEndTyping("hold release")
                 playChime("stop")
                 syncMenubar()
@@ -936,14 +990,11 @@ end)
 bdTap:start()
 
 hs.hotkey.bind({"ctrl", "alt", "cmd"}, "escape", function()
-    cancelPending()
-    state = "idle"
-    finishPendingEnd("cancel")
+    resetDictateState("cancel")
     playChime("cancel")
-    syncMenubar()
 end)
 
--- Kick off the BloomDictate.app streamer + the polling loop on Hammerspoon load.
+-- Kick off the Mist streamer + the polling loop on Hammerspoon load.
 ensureStreamerRunning()
 hs.timer.doAfter(1.0, ensurePolling)
 
@@ -953,6 +1004,15 @@ hs.timer.doAfter(1.0, ensurePolling)
 bdHealthTimer = hs.timer.doEvery(5.0, function()
     ensureStreamerRunning()
     ensurePolling(false)
+    local now = hs.timer.secondsSinceEpoch()
+    if isTyping and state == "rec_hold" and not rcmdDown
+       and pendingEndTimer == nil
+       and (now - typingStateChangedAt) > (END_GRACE_SEC + 2.0) then
+        resetDictateState("stale hold without keydown")
+    elseif state == "tap_pending" and pendingStopTimer == nil
+       and (now - typingStateChangedAt) > (DOUBLE_TAP_WINDOW + 1.0) then
+        resetDictateState("stale tap pending")
+    end
     syncMenubar()
 end)
 

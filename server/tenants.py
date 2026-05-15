@@ -1,4 +1,4 @@
-"""Tenant config loader for Bloom Dictate."""
+"""Tenant config loader for Mist."""
 from __future__ import annotations
 
 from pathlib import Path

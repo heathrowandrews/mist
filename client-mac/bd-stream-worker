@@ -1,5 +1,5 @@
 #!/usr/bin/env -S /usr/bin/python3 -u
-"""bd-stream-worker — stable-prefix streaming for Bloom Dictate.
+"""bd-stream-worker — stable-prefix streaming for Mist.
 
 While bd-managed ffmpeg writes 5-second WAV segments, this worker:
 
@@ -162,15 +162,20 @@ def transcribe(audio_path: Path, daemon_url: str, token: str, tenant: str) -> st
     cmd = [
         "curl", "-sS", "--max-time", str(DAEMON_TIMEOUT_S),
         "-X", "POST", f"{daemon_url}/transcribe",
-        "-H", f"Authorization: Bearer {token}",
+        "-H", "@-",
         "-F", f"audio=@{audio_path}",
         "-F", f"tenant_id={tenant}",
         "-F", "mode=raw",
         "-F", "correct=false",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=DAEMON_TIMEOUT_S + 5)
+        result = subprocess.run(
+            cmd,
+            input=f"Authorization: Bearer {token}\n",
+            capture_output=True,
+            text=True,
+            timeout=DAEMON_TIMEOUT_S + 5,
+        )
     except subprocess.TimeoutExpired:
         log("curl timeout")
         return ""

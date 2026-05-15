@@ -69,7 +69,8 @@ final class StreamingRecognizer: @unchecked Sendable {
             req.taskHint = .dictation
             req.addsPunctuation = true
             req.contextualStrings = [
-                "Bloom Dictate",
+                "Mist",
+                "Bloom",
                 "OpenClaw",
                 "Tailscale",
                 "Plaud",

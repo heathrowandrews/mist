@@ -1,4 +1,4 @@
-// BloomDictate v0 — SFSpeech streamer.
+// Mist — SFSpeech streamer.
 //
 // Captures mic audio via AVCaptureSession (sidesteps the AVAudioEngine
 // input-tap bug that paused the earlier prototype), feeds buffers into Apple's
@@ -339,10 +339,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = menubar.button else { return }
         if recording {
             button.title = "🎙"
-            button.toolTip = "Bloom Dictate · recording"
+            button.toolTip = "Mist · recording"
         } else {
             button.title = "🌱"
-            button.toolTip = "Bloom Dictate · hold Right-⌘ or double-tap to lock"
+            button.toolTip = "Mist · hold Right-⌘ or double-tap to lock"
         }
     }
 

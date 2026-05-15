@@ -1,8 +1,8 @@
-# Bloom Dictate
+# Mist
 
-Native-feeling push-to-talk dictation for macOS.
+Native-feeling push-to-talk dictation for macOS, powered by Bloom.
 
-Bloom Dictate runs Apple's on-device `SFSpeechRecognizer` continuously, streams partial transcripts to a local JSONL file, and uses Hammerspoon to type text into the focused app while you hold a hotkey. It is designed to feel like macOS dictation, but with hackable glossary correction and a local server path for Whisper/Ollama experiments.
+Mist runs Apple's on-device `SFSpeechRecognizer` continuously, streams partial transcripts to a local JSONL file, and uses Hammerspoon to type text into the focused app while you hold a hotkey. It is designed to feel like macOS dictation, but with hackable glossary correction and a local server path for Whisper/Ollama experiments.
 
 ## Current Shape
 
@@ -19,7 +19,7 @@ Requirements:
 - macOS 14+
 - Xcode command line tools / SwiftPM
 - Hammerspoon with Accessibility permission
-- Microphone and Speech Recognition permission for `BloomDictate.app`
+- Microphone and Speech Recognition permission for `Mist.app`
 
 Build and install the app bundle:
 
@@ -31,12 +31,12 @@ make app
 Start the streamer:
 
 ```bash
-open -n ~/Applications/BloomDictate.app --args --streamer
+open -n ~/Applications/Mist.app --args --streamer
 ```
 
-Install the Hammerspoon bridge by copying `client-mac/hammerspoon-bloom-dictate.lua` into `~/.hammerspoon/init.lua` or loading it from your existing config.
+Install the Hammerspoon bridge by copying `client-mac/hammerspoon-mist.lua` into `~/.hammerspoon/init.lua` or loading it from your existing config.
 
-The streamer writes events to:
+The streamer writes events to the existing Bloom-compatible state directory:
 
 ```text
 ~/.bloom-dictate/dictate-stream.jsonl
@@ -70,6 +70,8 @@ cd server
 BLOOM_DICTATE_TOKEN="$(openssl rand -hex 32)" python3 -m uvicorn main:app --host 127.0.0.1 --port 8788
 ```
 
+The server fails closed if `BLOOM_DICTATE_TOKEN` is missing. For local-only development without auth, explicitly set `BLOOM_DICTATE_ALLOW_NO_AUTH=1`.
+
 Point `client-mac/bd` at the daemon with:
 
 ```bash
@@ -82,7 +84,9 @@ export BLOOM_DICTATE_TENANT=default
 
 - This is not notarized or packaged for general users yet.
 - The hotkey bridge currently depends on Hammerspoon because native Swift event-tap delivery was unreliable during development.
-- Bluetooth headset inputs can be unreliable on macOS when the device stays in high-quality stereo mode. Bloom Dictate avoids known-problem AirPods/Beats capture inputs and falls back to the built-in mic when available. Set `BLOOM_DICTATE_PREFER_SYSTEM_INPUT=1` to force the macOS default input, or `BLOOM_DICTATE_AUDIO_DEVICE=<name-or-id>` to pick a specific device.
+- Bluetooth headset inputs can be unreliable on macOS when the device stays in high-quality stereo mode. Mist avoids known-problem AirPods/Beats capture inputs and falls back to the built-in mic when available. Set `BLOOM_DICTATE_PREFER_SYSTEM_INPUT=1` to force the macOS default input, or `BLOOM_DICTATE_AUDIO_DEVICE=<name-or-id>` to pick a specific device.
+- `client-mac/mist doctor` checks local health without printing secrets. `client-mac/mist reset` clears Hammerspoon dictation state if a hotkey session ever feels stuck. `client-mac/bd` remains as a compatibility alias for early builds.
+- `scripts/privacy-scan.sh` is the release gate for private paths, raw bearer headers, and token-shaped hex strings.
 
 ## License
 

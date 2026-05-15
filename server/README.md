@@ -1,4 +1,4 @@
-# bloom-dictate server
+# Mist server
 
 Local push-to-talk transcription daemon. See `../docs/spec.md` for the API contract.
 
@@ -10,13 +10,14 @@ Local push-to-talk transcription daemon. See `../docs/spec.md` for the API contr
 ## Layout
 - `main.py` — FastAPI app, endpoints, mlx-audio integration, Ollama post-correction + prompt-mode
 - `tenants.py` — Pydantic config schema + glossary -> initial_prompt builder
-- `launchd/com.bloom.bloom-dictate.plist` — example launchd unit
+- `launchd/com.bloom.mist.plist` — example launchd unit
 
 ## Environment
 Set in launchd plist; can be overridden in shell for dev:
 - `BLOOM_DICTATE_HOST` (default `127.0.0.1`)
 - `BLOOM_DICTATE_PORT` (default `8788`)
 - `BLOOM_DICTATE_TOKEN` — bearer token, usually sourced from `~/.bloom-env`
+- `BLOOM_DICTATE_ALLOW_NO_AUTH=1` — explicit local-dev override for running without a token
 - `BLOOM_DICTATE_DATA` (default `~/.bloom-dictate`)
 - `BLOOM_DICTATE_MODEL` (default `mlx-community/whisper-large-v3-turbo`)
 - `OLLAMA_URL` (default `http://localhost:11434`)

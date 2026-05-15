@@ -1,4 +1,4 @@
-# Bloom Dictate tenant config example.
+# Mist tenant config example.
 #
 # Copy to ~/.bloom-dictate/config/default.yaml and edit terms/phrases for
 # your own names, products, clients, and workflow words.
@@ -10,7 +10,8 @@ model: mlx-community/whisper-large-v3-turbo
 keep_audio: false
 
 terms:
-  - Bloom Dictate
+  - Mist
+  - Bloom
   - Hammerspoon
   - Tailscale
   - OpenClaw

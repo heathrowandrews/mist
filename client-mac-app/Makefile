@@ -1,8 +1,8 @@
-APP_NAME = BloomDictate
+APP_NAME = Mist
 INSTALL_DIR = $(HOME)/Applications
 APP_BUNDLE = $(INSTALL_DIR)/$(APP_NAME).app
 BUILD_DIR = .build/release
-BIN = $(BUILD_DIR)/$(APP_NAME)
+BIN = $(BUILD_DIR)/BloomDictate
 
 .PHONY: build app install clean run
 
@@ -22,7 +22,7 @@ app: build
 	# grants by bundle ID (stable across rebuilds), not the SwiftPM-default
 	# binary-name identifier that ad-hoc would pick.
 	@codesign --sign - --force --deep \
-		--identifier com.bloom.bloom-dictate-mac \
+		--identifier com.bloom.mist \
 		"$(APP_BUNDLE)" >/dev/null 2>&1 || true
 	@echo "wrote $(APP_BUNDLE) (ad-hoc signed with stable identifier)"
 

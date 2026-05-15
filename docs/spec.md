@@ -1,16 +1,16 @@
-# Bloom Dictate — Daemon Spec
+# Mist — Daemon Spec
 
 **Version:** 1.0
 **Date:** 2026-05-08
 **Owner:** local operator
 
 ## Mission
-Stand up a local `bloom-dictate` daemon. It is a push-to-talk transcription service with per-tenant glossary biasing and optional Ollama post-correction.
+Stand up a local Mist daemon. It is a push-to-talk transcription service with per-tenant glossary biasing and optional Ollama post-correction.
 
 ## Deployment
 
 - **Host:** your local Mac or a private LAN/Tailscale machine
-- **launchd label:** `com.bloom.bloom-dictate`
+- **launchd label:** `com.bloom.mist`
 - **Working directory:** wherever you clone the repo
 - **Port:** 8788 by default
 - **Bind:** default to `127.0.0.1`. If exposing over Tailscale/LAN, bind only to that private interface and keep bearer auth enabled. Do not expose directly to the public internet.
@@ -20,6 +20,7 @@ Stand up a local `bloom-dictate` daemon. It is a push-to-talk transcription serv
 
 - Bearer token in env var `BLOOM_DICTATE_TOKEN`, usually sourced from `~/.bloom-env`.
 - All endpoints except `/health` require `Authorization: Bearer <token>`. `/health` is unauthenticated for monitoring.
+- If `BLOOM_DICTATE_TOKEN` is missing, the server fails closed unless `BLOOM_DICTATE_ALLOW_NO_AUTH=1` is set for local development.
 
 ## Endpoints
 
@@ -148,7 +149,7 @@ The daemon is verified when ALL of these pass:
 3. `curl -X POST http://127.0.0.1:8788/transcribe -H "Authorization: Bearer $TOKEN" -F "audio=@test.m4a" -F "tenant_id=default"` returns valid JSON with non-empty `raw`.
 4. **Glossary biasing verified:** record a short test clip with terms from your tenant config and confirm `corrected` preserves them.
 5. `~/.bloom-dictate/history/default/<today>.jsonl` has the request entry.
-6. `launchctl print gui/<uid>/com.bloom.bloom-dictate` shows it loaded and running if using launchd.
+6. `launchctl print gui/<uid>/com.bloom.mist` shows it loaded and running if using launchd.
 
 ## Constraints / rules of engagement
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# bloom-dictate launcher. Sources ~/.bloom-env so BLOOM_DICTATE_TOKEN never
+# Mist launcher. Sources ~/.bloom-env so BLOOM_DICTATE_TOKEN never
 # touches the plist on disk. Called by launchd.
 set -euo pipefail
 

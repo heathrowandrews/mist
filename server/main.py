@@ -1,4 +1,4 @@
-"""Bloom Dictate daemon — local push-to-talk transcription with glossary biasing.
+"""Mist daemon — local push-to-talk transcription with glossary biasing.
 
 Endpoints:
   GET  /health
@@ -9,6 +9,7 @@ Loaded once at startup: whisper model, all tenant configs.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -29,6 +30,7 @@ from tenants import TenantConfig, build_initial_prompt, load_tenant
 HOST = os.environ.get("BLOOM_DICTATE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BLOOM_DICTATE_PORT", "8788"))
 TOKEN = os.environ.get("BLOOM_DICTATE_TOKEN", "")
+ALLOW_NO_AUTH = os.environ.get("BLOOM_DICTATE_ALLOW_NO_AUTH", "") == "1"
 DEFAULT_MODEL = os.environ.get(
     "BLOOM_DICTATE_MODEL", "mlx-community/whisper-large-v3-turbo"
 )
@@ -39,7 +41,7 @@ HISTORY_DIR = DATA_DIR / "history"
 AUDIO_DIR = DATA_DIR / "audio"
 LOG_DIR = DATA_DIR / "logs"
 
-VERSION = "1.0.0"
+VERSION = "1.0.3"
 START_TS = time.time()
 
 MAX_AUDIO_BYTES = 25 * 1024 * 1024  # 25 MB
@@ -48,6 +50,7 @@ ALLOWED_EXT = {"m4a", "mp3", "wav", "aiff", "webm", "mp4", "ogg", "flac"}
 # Loaded at startup
 _models: dict[str, Any] = {}
 _tenants: dict[str, TenantConfig] = {}
+_transcribe_lock = asyncio.Lock()
 
 
 # --- Lifecycle -------------------------------------------------------------
@@ -74,7 +77,7 @@ async def lifespan(app: FastAPI):
     print("[shutdown] bye", flush=True)
 
 
-app = FastAPI(title="Bloom Dictate", version=VERSION, lifespan=lifespan)
+app = FastAPI(title="Mist", version=VERSION, lifespan=lifespan)
 
 
 def _load_model(name: str):
@@ -88,7 +91,9 @@ def _load_model(name: str):
 
 def check_auth(authorization: Optional[str]):
     if not TOKEN:
-        return  # auth disabled (dev only — DO NOT run in prod without token)
+        if ALLOW_NO_AUTH:
+            return
+        raise HTTPException(status_code=503, detail="server auth token not configured")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     if authorization[7:].strip() != TOKEN:
@@ -143,6 +148,8 @@ async def transcribe(
         raise HTTPException(404, f"unknown tenant: {tenant_id}")
     if mode not in {"raw", "prompt"}:
         raise HTTPException(400, f"invalid mode: {mode}")
+    if _transcribe_lock.locked():
+        raise HTTPException(429, "transcriber busy")
 
     tenant = _tenants[tenant_id]
     do_correct = correct.lower() not in ("false", "0", "no")
@@ -163,49 +170,50 @@ async def transcribe(
     tmp_path.write_bytes(raw_bytes)
 
     try:
-        t0 = time.time()
-        initial_prompt = build_initial_prompt(tenant)
-        model_name = tenant.model or DEFAULT_MODEL
-        model = _load_model(model_name)
+        async with _transcribe_lock:
+            t0 = time.time()
+            initial_prompt = build_initial_prompt(tenant)
+            model_name = tenant.model or DEFAULT_MODEL
+            model = _load_model(model_name)
 
-        # Streaming mode (correct=false) uses aggressive anti-hallucination
-        # params. The default condition_on_previous_text=True is the #1 cause
-        # of repeat loops on short/silent chunks ("for the whole point. for
-        # the whole point...").
-        gen_kwargs = dict(
-            language=language or tenant.language,
-            initial_prompt=initial_prompt,
-        )
-        if not do_correct:
-            gen_kwargs.update(
-                condition_on_previous_text=False,
-                compression_ratio_threshold=2.0,
-                no_speech_threshold=0.45,
-                temperature=0.0,
+            # Streaming mode (correct=false) uses aggressive anti-hallucination
+            # params. The default condition_on_previous_text=True is the #1 cause
+            # of repeat loops on short/silent chunks ("for the whole point. for
+            # the whole point...").
+            gen_kwargs = dict(
+                language=language or tenant.language,
+                initial_prompt=initial_prompt,
             )
-        result = model.generate(str(tmp_path), **gen_kwargs)
-        raw_text = (getattr(result, "text", "") or "").strip()
-        audio_seconds = float(getattr(result, "total_time", 0.0) or 0.0)
+            if not do_correct:
+                gen_kwargs.update(
+                    condition_on_previous_text=False,
+                    compression_ratio_threshold=2.0,
+                    no_speech_threshold=0.45,
+                    temperature=0.0,
+                )
+            result = model.generate(str(tmp_path), **gen_kwargs)
+            raw_text = (getattr(result, "text", "") or "").strip()
+            audio_seconds = float(getattr(result, "total_time", 0.0) or 0.0)
 
-        corrected = raw_text
-        if do_correct and tenant.post_correction.enabled and raw_text:
-            try:
-                corrected = await _ollama_correct(raw_text, tenant)
-            except Exception as e:
-                print(f"[transcribe] post-correct failed: {e}", flush=True)
+            corrected = raw_text
+            if do_correct and tenant.post_correction.enabled and raw_text:
+                try:
+                    corrected = await _ollama_correct(raw_text, tenant)
+                except Exception as e:
+                    print(f"[transcribe] post-correct failed: {e}", flush=True)
 
-        structured = None
-        model_tag = model_name
-        if mode == "prompt" and tenant.prompt_mode.enabled:
-            try:
-                structured = await _ollama_prompt(corrected, tenant)
-                model_tag = f"{model_name} + {tenant.prompt_mode.model}"
-            except Exception as e:
-                print(f"[transcribe] prompt-mode failed: {e}", flush=True)
-        elif tenant.post_correction.enabled and corrected != raw_text:
-            model_tag = f"{model_name} + {tenant.post_correction.model}"
+            structured = None
+            model_tag = model_name
+            if mode == "prompt" and tenant.prompt_mode.enabled:
+                try:
+                    structured = await _ollama_prompt(corrected, tenant)
+                    model_tag = f"{model_name} + {tenant.prompt_mode.model}"
+                except Exception as e:
+                    print(f"[transcribe] prompt-mode failed: {e}", flush=True)
+            elif tenant.post_correction.enabled and corrected != raw_text:
+                model_tag = f"{model_name} + {tenant.post_correction.model}"
 
-        duration_ms = int((time.time() - t0) * 1000)
+            duration_ms = int((time.time() - t0) * 1000)
 
         result_json = {
             "raw": raw_text,
@@ -247,7 +255,7 @@ async def transcribe(
     except Exception as e:
         tmp_path.unlink(missing_ok=True)
         print(f"[transcribe] engine error: {e}", flush=True)
-        raise HTTPException(500, f"engine error: {e}")
+        raise HTTPException(500, "engine error")
 
 
 # --- Ollama integration ----------------------------------------------------
